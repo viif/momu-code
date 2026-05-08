@@ -1,7 +1,10 @@
 import os
 import subprocess
+from collections.abc import Iterator
+from typing import TypedDict, cast
 
 from anthropic import Anthropic
+from anthropic.types import Message, MessageParam, ToolParam, ToolResultBlockParam, ToolUseBlock
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -14,7 +17,12 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
-TOOLS = [
+
+class BashToolInput(TypedDict):
+    command: str
+
+
+TOOLS: list[ToolParam] = [
     {
         "name": "bash",
         "description": "Run a shell command.",
@@ -48,48 +56,66 @@ def run_bash(command: str) -> str:
         return f"Error: {e}"
 
 
-# -- The core pattern: a while loop that calls tools until the model stops --
-def agent_loop(messages: list):
+def iter_text_blocks(content: object) -> Iterator[str]:
+    if not isinstance(content, list):
+        return
+
+    for block in content:
+        if isinstance(block, dict):
+            typed_block = cast(dict[str, object], block)
+            if typed_block.get("type") == "text":
+                yield cast(str, typed_block["text"])
+        elif block.type == "text":
+            yield block.text
+
+
+def execute_tool_block(block: ToolUseBlock) -> ToolResultBlockParam:
+    tool_input = cast(BashToolInput, block.input)
+    command = tool_input["command"]
+    print(f"\033[33m$ {command}\033[0m")
+    output = run_bash(command)
+    print(output[:200])
+    return {"type": "tool_result", "tool_use_id": block.id, "content": output}
+
+
+def create_response(messages: list[MessageParam]) -> Message:
+    return client.messages.create(
+        model=MODEL,
+        system=SYSTEM,
+        messages=messages,
+        tools=TOOLS,
+        max_tokens=8000,
+    )
+
+
+# -- 核心模式：一个循环调用工具的 while 循环，直到模型停止 --
+def agent_loop(messages: list[MessageParam]) -> None:
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=8000,
-        )
-        # Append assistant turn
+        response = create_response(messages)
+        # 追加助手的回复内容
         messages.append({"role": "assistant", "content": response.content})
-        # If the model didn't call a tool, we're done
+        # 如果模型没有调用工具，说明任务结束
         if response.stop_reason != "tool_use":
             return
-        # Execute each tool call, collect results
-        results = []
+        # 执行每个工具调用，并收集结果
+        results: list[ToolResultBlockParam] = []
         for block in response.content:
             if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
-                print(output[:200])
-                results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
-                )
+                results.append(execute_tool_block(block))
         messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
-    history = []
+    history: list[MessageParam] = []
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("\033[36muser >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        for text in iter_text_blocks(history[-1]["content"]):
+            print(text)
         print()
