@@ -4,7 +4,13 @@ from collections.abc import Iterator
 from typing import TypedDict, cast
 
 from anthropic import Anthropic
-from anthropic.types import Message, MessageParam, ToolParam, ToolResultBlockParam, ToolUseBlock
+from anthropic.types import (
+    Message,
+    MessageParam,
+    ToolParam,
+    ToolResultBlockParam,
+    ToolUseBlock,
+)
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
