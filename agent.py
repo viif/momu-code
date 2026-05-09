@@ -1,7 +1,8 @@
 import os
 import subprocess
 from collections.abc import Iterator
-from typing import TypedDict, cast
+from pathlib import Path
+from typing import NotRequired, TypedDict, cast
 
 from anthropic import Anthropic
 from anthropic.types import (
@@ -18,14 +19,31 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
+WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
 
 class BashToolInput(TypedDict):
     command: str
+
+
+class ReadToolInput(TypedDict):
+    path: str
+    limit: NotRequired[int]
+
+
+class WriteToolInput(TypedDict):
+    path: str
+    content: str
+
+
+class EditToolInput(TypedDict):
+    path: str
+    old_text: str
+    new_text: str
 
 
 TOOLS: list[ToolParam] = [
@@ -37,8 +55,52 @@ TOOLS: list[ToolParam] = [
             "properties": {"command": {"type": "string"}},
             "required": ["command"],
         },
-    }
+    },
+    {
+        "name": "read_file",
+        "description": "Read file contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace exact text in file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
 ]
+
+
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
 
 
 def run_bash(command: str) -> str:
@@ -49,7 +111,7 @@ def run_bash(command: str) -> str:
         r = subprocess.run(
             command,
             shell=True,
-            cwd=os.getcwd(),
+            cwd=WORKDIR,
             capture_output=True,
             text=True,
             timeout=120,
@@ -60,6 +122,55 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
+
+
+def run_read(path: str, limit: int | None = None) -> str:
+    try:
+        text = safe_path(path).read_text()
+        lines = text.splitlines()
+        if limit and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        return "\n".join(lines)[:50000]
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_write(path: str, content: str) -> str:
+    try:
+        file_path = safe_path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_edit(path: str, old_text: str, new_text: str) -> str:
+    try:
+        file_path = safe_path(path)
+        content = file_path.read_text()
+        if old_text not in content:
+            return f"Error: Text not found in {path}"
+        file_path.write_text(content.replace(old_text, new_text, 1))
+        return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+TOOL_HANDLERS = {
+    "bash": lambda **kw: run_bash(cast(BashToolInput, kw)["command"]),
+    "read_file": lambda **kw: run_read(
+        cast(ReadToolInput, kw)["path"], cast(ReadToolInput, kw).get("limit")
+    ),
+    "write_file": lambda **kw: run_write(
+        cast(WriteToolInput, kw)["path"], cast(WriteToolInput, kw)["content"]
+    ),
+    "edit_file": lambda **kw: run_edit(
+        cast(EditToolInput, kw)["path"],
+        cast(EditToolInput, kw)["old_text"],
+        cast(EditToolInput, kw)["new_text"],
+    ),
+}
 
 
 def iter_text_blocks(content: object) -> Iterator[str]:
@@ -76,10 +187,9 @@ def iter_text_blocks(content: object) -> Iterator[str]:
 
 
 def execute_tool_block(block: ToolUseBlock) -> ToolResultBlockParam:
-    tool_input = cast(BashToolInput, block.input)
-    command = tool_input["command"]
-    print(f"\033[33m$ {command}\033[0m")
-    output = run_bash(command)
+    handler = TOOL_HANDLERS.get(block.name)
+    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+    print(f"> {block.name}:")
     print(output[:200])
     return {"type": "tool_result", "tool_use_id": block.id, "content": output}
 
