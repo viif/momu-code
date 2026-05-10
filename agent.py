@@ -2,12 +2,13 @@ import os
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from anthropic import Anthropic
 from anthropic.types import (
     Message,
     MessageParam,
+    TextBlockParam,
     ToolParam,
     ToolResultBlockParam,
     ToolUseBlock,
@@ -23,7 +24,11 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
+    "Act, don't explain. Use the todo tool to plan multi-step tasks. "
+    "Mark in_progress before starting and completed when done."
+)
 
 
 class BashToolInput(TypedDict):
@@ -44,6 +49,19 @@ class EditToolInput(TypedDict):
     path: str
     old_text: str
     new_text: str
+
+
+TodoStatus = Literal["pending", "in_progress", "completed"]
+
+
+class TodoItemInput(TypedDict):
+    id: str
+    text: str
+    status: TodoStatus
+
+
+class TodoToolInput(TypedDict):
+    items: list[TodoItemInput]
 
 
 TOOLS: list[ToolParam] = [
@@ -93,7 +111,89 @@ TOOLS: list[ToolParam] = [
             "required": ["path", "old_text", "new_text"],
         },
     },
+    {
+        "name": "todo",
+        "description": "Update task list. Track progress on multi-step tasks.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "required": ["id", "text", "status"],
+                    },
+                }
+            },
+            "required": ["items"],
+        },
+    },
 ]
+
+
+class TodoManager:
+    def __init__(self) -> None:
+        self.items: list[TodoItemInput] = []
+
+    def update(self, items: list[TodoItemInput]) -> str:
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+
+        validated: list[TodoItemInput] = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            item_id = str(item.get("id", str(i + 1)))
+            text = str(item.get("text", "")).strip()
+            status = cast(str, item.get("status", "pending")).lower()
+
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id}: invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+
+            validated.append(
+                {
+                    "id": item_id,
+                    "text": text,
+                    "status": cast(TodoStatus, status),
+                }
+            )
+
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+
+        lines: list[str] = []
+        for item in self.items:
+            marker = {
+                "pending": "[ ]",
+                "in_progress": "[>]",
+                "completed": "[x]",
+            }[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+
+        done = sum(1 for item in self.items if item["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
 
 
 def safe_path(p: str) -> Path:
@@ -170,6 +270,7 @@ TOOL_HANDLERS = {
         cast(EditToolInput, kw)["old_text"],
         cast(EditToolInput, kw)["new_text"],
     ),
+    "todo": lambda **kw: TODO.update(cast(TodoToolInput, kw)["items"]),
 }
 
 
@@ -206,6 +307,7 @@ def create_response(messages: list[MessageParam]) -> Message:
 
 # -- 核心模式：一个循环调用工具的 while 循环，直到模型停止 --
 def agent_loop(messages: list[MessageParam]) -> None:
+    rounds_since_todo = 0
     while True:
         response = create_response(messages)
         # 追加助手的回复内容
@@ -214,10 +316,18 @@ def agent_loop(messages: list[MessageParam]) -> None:
         if response.stop_reason != "tool_use":
             return
         # 执行每个工具调用，并收集结果
-        results: list[ToolResultBlockParam] = []
+        results: list[ToolResultBlockParam | TextBlockParam] = []
+        used_todo = False
         for block in response.content:
             if block.type == "tool_use":
                 results.append(execute_tool_block(block))
+                if block.name == "todo":
+                    used_todo = True
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            results.append(
+                {"type": "text", "text": "<reminder>Update your todos.</reminder>"}
+            )
         messages.append({"role": "user", "content": results})
 
 
