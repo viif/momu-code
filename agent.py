@@ -1,11 +1,13 @@
-"""极简 Python Agent Harness：支持基础工具调用、todo 跟踪与 subagent 委派。"""
+"""极简 Python Agent Harness：支持基础工具调用、todo 跟踪、skill 按需加载与 subagent 委派。"""
 
 import os
+import re
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+import yaml
 from anthropic import Anthropic
 from anthropic.types import (
     Message,
@@ -25,16 +27,86 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+SKILLS_DIR = WORKDIR / "skills"
 
-SYSTEM = (
+
+class SkillMeta(TypedDict):
+    name: str
+    description: str
+
+
+class SkillRecord(TypedDict):
+    meta: SkillMeta
+    body: str
+    path: str
+
+
+# -- SkillLoader: 扫描 skills/<name>/SKILL.md 文件，并解析其 YAML frontmatter --
+class SkillLoader:
+    def __init__(self, skills_dir: Path) -> None:
+        self.skills_dir = skills_dir
+        self.skills: dict[str, SkillRecord] = {}
+        self._load_all()
+
+    def _load_all(self) -> None:
+        if not self.skills_dir.exists():
+            return
+        for file_path in sorted(self.skills_dir.rglob("SKILL.md")):
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            meta, body = self._parse_frontmatter(text)
+            name = str(meta.get("name") or file_path.parent.name)
+            description = str(meta.get("description") or "No description")
+            self.skills[name] = {
+                "meta": {"name": name, "description": description},
+                "body": body,
+                "path": str(file_path),
+            }
+
+    def _parse_frontmatter(self, text: str) -> tuple[dict[str, object], str]:
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text.strip()
+        try:
+            meta = yaml.safe_load(match.group(1)) or {}
+        except yaml.YAMLError:
+            meta = {}
+        return cast(dict[str, object], meta), match.group(2).strip()
+
+    def get_descriptions(self) -> str:
+        if not self.skills:
+            return "(no skills available)"
+        return "\n".join(
+            f"  - {name}: {skill['meta']['description']}"
+            for name, skill in self.skills.items()
+        )
+
+    def get_content(self, name: str) -> str:
+        skill = self.skills.get(name)
+        if not skill:
+            available = ", ".join(self.skills.keys()) or "(none)"
+            return f"Error: Unknown skill '{name}'. Available: {available}"
+        return f'<skill name="{name}">\n{skill["body"]}\n</skill>'
+
+
+# Skills 第 1 层：注入到系统提示词中的技能元数据
+def build_system_prompt(base: str) -> str:
+    return (
+        base
+        + "Use load_skill to load specialized instructions only when relevant.\n\n"
+        + f"Skills available:\n{SKILL_LOADER.get_descriptions()}"
+    )
+
+
+SKILL_LOADER = SkillLoader(SKILLS_DIR)
+SYSTEM = build_system_prompt(
     f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
     "Act, don't explain. Use the todo tool to plan multi-step tasks. "
     "Use the task tool to delegate exploration or scoped subtasks. "
-    "Mark in_progress before starting and completed when done."
+    "Mark in_progress before starting and completed when done. "
 )
-SUBAGENT_SYSTEM = (
+SUBAGENT_SYSTEM = build_system_prompt(
     f"You are a coding subagent at {WORKDIR}. Complete the given task "
-    "with fresh context, then return a concise summary."
+    "with fresh context, then return a concise summary. "
 )
 
 
@@ -61,6 +133,10 @@ class EditToolInput(TypedDict):
 class TaskToolInput(TypedDict):
     prompt: str
     description: NotRequired[str]
+
+
+class LoadSkillToolInput(TypedDict):
+    name: str
 
 
 TodoStatus = Literal["pending", "in_progress", "completed"]
@@ -121,6 +197,20 @@ BASE_TOOLS: list[ToolParam] = [
                 "new_text": {"type": "string"},
             },
             "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "load_skill",
+        "description": "Load specialized knowledge by skill name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name to load",
+                }
+            },
+            "required": ["name"],
         },
     },
 ]
@@ -307,6 +397,10 @@ TOOL_HANDLERS = {
         cast(EditToolInput, kw)["path"],
         cast(EditToolInput, kw)["old_text"],
         cast(EditToolInput, kw)["new_text"],
+    ),
+    # 技能加载工具：按需加载技能内容，避免一次性注入过多信息
+    "load_skill": lambda **kw: SKILL_LOADER.get_content(
+        cast(LoadSkillToolInput, kw)["name"]
     ),
     "todo": lambda **kw: TODO.update(cast(TodoToolInput, kw)["items"]),
 }
