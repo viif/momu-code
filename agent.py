@@ -348,81 +348,84 @@ class TodoToolInput(TypedDict):
     items: list[TodoItemInput]
 
 
-BASE_TOOLS: list[ToolParam] = [
-    {
-        "name": "compact",
-        "description": "Compress the conversation context and keep only a continuity summary.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "focus": {
-                    "type": "string",
-                    "description": "What to preserve in the summary",
-                }
-            },
+COMPACT_TOOL: ToolParam = {
+    "name": "compact",
+    "description": "Compress the conversation context and keep only a continuity summary.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "focus": {
+                "type": "string",
+                "description": "What to preserve in the summary",
+            }
         },
     },
-    {
-        "name": "bash",
-        "description": "Run a shell command.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
+}
+
+BASH_TOOL: ToolParam = {
+    "name": "bash",
+    "description": "Run a shell command.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
     },
-    {
-        "name": "read_file",
-        "description": "Read file contents.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "limit": {"type": "integer"},
-            },
-            "required": ["path"],
+}
+
+READ_FILE_TOOL: ToolParam = {
+    "name": "read_file",
+    "description": "Read file contents.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "limit": {"type": "integer"},
         },
+        "required": ["path"],
     },
-    {
-        "name": "write_file",
-        "description": "Write content to file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-            },
-            "required": ["path", "content"],
+}
+
+WRITE_FILE_TOOL: ToolParam = {
+    "name": "write_file",
+    "description": "Write content to file.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
         },
+        "required": ["path", "content"],
     },
-    {
-        "name": "edit_file",
-        "description": "Replace exact text in file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "old_text": {"type": "string"},
-                "new_text": {"type": "string"},
-            },
-            "required": ["path", "old_text", "new_text"],
+}
+
+EDIT_FILE_TOOL: ToolParam = {
+    "name": "edit_file",
+    "description": "Replace exact text in file.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "old_text": {"type": "string"},
+            "new_text": {"type": "string"},
         },
+        "required": ["path", "old_text", "new_text"],
     },
-    {
-        "name": "load_skill",
-        "description": "Load specialized knowledge by skill name.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Skill name to load",
-                }
-            },
-            "required": ["name"],
+}
+
+LOAD_SKILL_TOOL: ToolParam = {
+    "name": "load_skill",
+    "description": "Load specialized knowledge by skill name.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Skill name to load",
+            }
         },
+        "required": ["name"],
     },
-]
+}
 
 TODO_TOOL: ToolParam = {
     "name": "todo",
@@ -737,46 +740,53 @@ CLAIM_TASK_TOOL: ToolParam = {
     },
 }
 
-# 父代理可用所有工具，子代理不可用 subagent 与持久化 task 工具以避免递归与状态混乱
-READ_ONLY_SUBAGENT_TOOLS: list[ToolParam] = [
-    BASE_TOOLS[0],
-    BASE_TOOLS[1],
-    BASE_TOOLS[2],
-    BASE_TOOLS[5],
+FILE_TOOLS: list[ToolParam] = [
+    READ_FILE_TOOL,
+    WRITE_FILE_TOOL,
+    EDIT_FILE_TOOL,
 ]
-WRITABLE_SUBAGENT_TOOLS: list[ToolParam] = [*BASE_TOOLS]
-TEAMMATE_TOOLS: list[ToolParam] = [
-    *BASE_TOOLS,
-    SEND_MESSAGE_TOOL,
-    READ_INBOX_TOOL,
-    SHUTDOWN_RESPONSE_TOOL,
-    PLAN_APPROVAL_TOOL,
-    IDLE_TOOL,
-    CLAIM_TASK_TOOL,
-    WORKTREE_STATUS_TOOL,
-    WORKTREE_RUN_TOOL,
-]
-PARENT_TOOLS: list[ToolParam] = [
-    *BASE_TOOLS,
-    TODO_TOOL,
+
+TASK_TOOLS: list[ToolParam] = [
     TASK_CREATE_TOOL,
     TASK_UPDATE_TOOL,
     TASK_LIST_TOOL,
     TASK_GET_TOOL,
-    TASK_BIND_WORKTREE_TOOL,
+]
+
+BACKGROUND_TOOLS: list[ToolParam] = [
     BACKGROUND_RUN_TOOL,
     CHECK_BACKGROUND_TOOL,
-    SUBAGENT_TOOL,
-    SPAWN_TEAMMATE_TOOL,
-    LIST_TEAMMATES_TOOL,
+]
+
+MESSAGE_TOOLS: list[ToolParam] = [
     SEND_MESSAGE_TOOL,
     READ_INBOX_TOOL,
     BROADCAST_TOOL,
     SHUTDOWN_REQUEST_TOOL,
     SHUTDOWN_RESPONSE_TOOL,
     PLAN_APPROVAL_TOOL,
+]
+
+TEAMMATE_MESSAGE_TOOLS: list[ToolParam] = [
+    SEND_MESSAGE_TOOL,
+    READ_INBOX_TOOL,
+    SHUTDOWN_RESPONSE_TOOL,
+    PLAN_APPROVAL_TOOL,
+]
+
+TEAMMATE_RUNTIME_TOOLS: list[ToolParam] = [
     IDLE_TOOL,
     CLAIM_TASK_TOOL,
+]
+
+TEAMMATE_MANAGEMENT_TOOLS: list[ToolParam] = [
+    SPAWN_TEAMMATE_TOOL,
+    LIST_TEAMMATES_TOOL,
+    *TEAMMATE_RUNTIME_TOOLS,
+]
+
+WORKTREE_TOOLS: list[ToolParam] = [
+    TASK_BIND_WORKTREE_TOOL,
     WORKTREE_CREATE_TOOL,
     WORKTREE_LIST_TOOL,
     WORKTREE_STATUS_TOOL,
@@ -784,6 +794,49 @@ PARENT_TOOLS: list[ToolParam] = [
     WORKTREE_KEEP_TOOL,
     WORKTREE_REMOVE_TOOL,
     WORKTREE_EVENTS_TOOL,
+]
+
+TEAMMATE_WORKTREE_TOOLS: list[ToolParam] = [
+    WORKTREE_STATUS_TOOL,
+    WORKTREE_RUN_TOOL,
+]
+
+BASE_TOOLS: list[ToolParam] = [
+    COMPACT_TOOL,
+    BASH_TOOL,
+    *FILE_TOOLS,
+    LOAD_SKILL_TOOL,
+]
+
+# Explore 子代理可用的只读工具：允许压缩、bash、读文件、加载 skill，不允许写文件或进入任务/协作工具。
+EXPLORE_SUBAGENT_TOOLS: list[ToolParam] = [
+    COMPACT_TOOL,
+    BASH_TOOL,
+    READ_FILE_TOOL,
+    LOAD_SKILL_TOOL,
+]
+
+# 通用子代理可用的基础工具：在 Explore 基础上允许写文件与编辑文件，但仍不暴露任务/协作工具。
+GENERAL_SUBAGENT_TOOLS: list[ToolParam] = [*BASE_TOOLS]
+
+# teammate 可用工具：基础工具 + 队友间消息/审批 + 运行时工具 + worktree 执行工具。
+TEAMMATE_AGENT_TOOLS: list[ToolParam] = [
+    *BASE_TOOLS,
+    *TEAMMATE_MESSAGE_TOOLS,
+    *TEAMMATE_RUNTIME_TOOLS,
+    *TEAMMATE_WORKTREE_TOOLS,
+]
+
+# lead 主 agent 可用工具：完整基础工具集 + todo/task/background/subagent + teammate/worktree 管理工具。
+LEAD_AGENT_TOOLS: list[ToolParam] = [
+    *BASE_TOOLS,
+    TODO_TOOL,
+    *TASK_TOOLS,
+    *BACKGROUND_TOOLS,
+    SUBAGENT_TOOL,
+    *TEAMMATE_MANAGEMENT_TOOLS,
+    *MESSAGE_TOOLS,
+    *WORKTREE_TOOLS,
 ]
 
 
@@ -1583,7 +1636,7 @@ class TeammateManager:
             tool_name,
             args,
             sender=sender,
-            allowed_tools={tool["name"] for tool in TEAMMATE_TOOLS},
+            allowed_tools={tool["name"] for tool in TEAMMATE_AGENT_TOOLS},
         )
 
     def _teammate_loop(self, name: str, role: str, prompt: str) -> None:
@@ -1618,7 +1671,7 @@ class TeammateManager:
                             + f"\n\nYour name is {name}. Your role is {role}. Team: {team_name}."
                         ),
                         messages=messages,
-                        tools=TEAMMATE_TOOLS,
+                        tools=TEAMMATE_AGENT_TOOLS,
                         max_tokens=8000,
                     )
                     messages.append({"role": "assistant", "content": response.content})
@@ -2251,7 +2304,7 @@ def run_subagent(
         {"role": "user", "content": prompt}
     ]  # 全新上下文
     sub_tools = (
-        READ_ONLY_SUBAGENT_TOOLS if agent_type == "Explore" else WRITABLE_SUBAGENT_TOOLS
+        EXPLORE_SUBAGENT_TOOLS if agent_type == "Explore" else GENERAL_SUBAGENT_TOOLS
     )
     response: Message | None = None
     for _ in range(30):  # 避免死循环，子代理最多调用工具30次
@@ -2339,7 +2392,7 @@ def create_response(messages: list[MessageParam]) -> Message:
         model=MODEL,
         system=SYSTEM,
         messages=messages,
-        tools=PARENT_TOOLS,
+        tools=LEAD_AGENT_TOOLS,
         max_tokens=8000,
     )
 
