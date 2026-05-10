@@ -60,14 +60,6 @@ uv run python agent.py
 - `.team/`：teammate 配置与 inbox 数据目录，由 harness 自动维护。
 - `.worktrees/`：worktree 索引与事件目录，由 harness 自动维护。
 
-## 当前技能
-
-仓库当前内置技能目录：
-- `agent-builder`
-- `code-review`
-- `mcp-builder`
-- `pdf`
-
 ## 致谢
 
-感谢 shareAI-lab 提供的 [《Learn Claude Code》](https://github.com/shareAI-lab/learn-claude-code) 项目启发。
+感谢 shareAI-lab 提供的 [《Learn Claude Code》](https://github.com/shareAI-lab/learn-claude-code) 教程。
