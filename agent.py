@@ -4,6 +4,9 @@ import json
 import os
 import re
 import subprocess
+import threading
+import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
@@ -104,6 +107,8 @@ SYSTEM = build_system_prompt(
     f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
     "Act, don't explain. Use the todo tool to plan current session work. "
     "Use task_* tools to manage persistent tasks across conversations. "
+    "Use background_run for long-running shell commands and check_background to inspect them. "
+    "Background task completions are delivered in <background-results>. "
     "Use the subagent tool to delegate exploration or scoped subtasks. "
     "Mark in_progress before starting and completed when done. "
 )
@@ -119,6 +124,7 @@ COMPACT_PRESERVE_RESULT_TOOLS = {
     "todo",
     "task_list",
     "task_get",
+    "check_background",
     "subagent",
 }
 ENABLE_SUBAGENT_AUTO_COMPACT = False
@@ -142,6 +148,14 @@ class EditToolInput(TypedDict):
     path: str
     old_text: str
     new_text: str
+
+
+class BackgroundRunToolInput(TypedDict):
+    command: str
+
+
+class CheckBackgroundToolInput(TypedDict):
+    task_id: NotRequired[str]
 
 
 class SubagentToolInput(TypedDict):
@@ -338,6 +352,25 @@ TASK_GET_TOOL: ToolParam = {
     },
 }
 
+BACKGROUND_RUN_TOOL: ToolParam = {
+    "name": "background_run",
+    "description": "Run a shell command in a background thread and return a task ID immediately.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    },
+}
+
+CHECK_BACKGROUND_TOOL: ToolParam = {
+    "name": "check_background",
+    "description": "Check one background task, or list all background tasks.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"task_id": {"type": "string"}},
+    },
+}
+
 SUBAGENT_TOOL: ToolParam = {
     "name": "subagent",
     "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
@@ -363,6 +396,8 @@ PARENT_TOOLS: list[ToolParam] = [
     TASK_UPDATE_TOOL,
     TASK_LIST_TOOL,
     TASK_GET_TOOL,
+    BACKGROUND_RUN_TOOL,
+    CHECK_BACKGROUND_TOOL,
     SUBAGENT_TOOL,
 ]
 
@@ -518,8 +553,104 @@ class TaskManager:
         return "\n".join(lines)
 
 
+# -- 后台任务管理器：线程执行 shell 命令并在下一轮注入通知 --
+class BackgroundManager:
+    def __init__(self) -> None:
+        self.tasks: dict[
+            str, dict[str, object]
+        ] = {}  # task_id -> {status, command, result, returncode, started_at, finished_at}
+        self._notification_queue: list[
+            dict[str, str]
+        ] = []  # {"task_id": str, "status": str, "command": str, "result": str}
+        self._lock = threading.Lock()
+
+    def run(self, command: str) -> str:
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {
+            "status": "running",
+            "command": command,
+            "result": None,
+            "returncode": None,
+            "started_at": time.time(),
+            "finished_at": None,
+        }
+        thread = threading.Thread(
+            target=self._execute, args=(task_id, command), daemon=True
+        )
+        thread.start()
+        return f"Background task {task_id} started: {command[:80]}"
+
+    def _execute(self, task_id: str, command: str) -> None:
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=WORKDIR,
+                capture_output=True,
+                text=False,
+                timeout=300,
+            )
+            stdout = (
+                result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+            )
+            stderr = (
+                result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+            )
+            output = (stdout + stderr).strip()[:50000]
+            status = "completed"
+            returncode: int | None = result.returncode
+        except subprocess.TimeoutExpired:
+            output = "Error: Timeout (300s)"
+            status = "timeout"
+            returncode = None
+        except Exception as e:
+            output = f"Error: {e}"
+            status = "error"
+            returncode = None
+
+        task = self.tasks[task_id]
+        task["status"] = status
+        task["result"] = output or "(no output)"
+        task["returncode"] = returncode
+        task["finished_at"] = time.time()
+
+        with self._lock:
+            self._notification_queue.append(
+                {
+                    "task_id": task_id,
+                    "status": status,
+                    "command": command[:80],
+                    "result": (output or "(no output)")[:500],
+                }
+            )
+
+    def check(self, task_id: str | None = None) -> str:
+        if task_id:
+            task = self.tasks.get(task_id)
+            if not task:
+                return f"Error: Unknown task {task_id}"
+            command = cast(str, task["command"])
+            status = cast(str, task["status"])
+            result = cast(str | None, task.get("result"))
+            return f"[{status}] {command[:60]}\n{result or '(running)'}"
+
+        lines: list[str] = []
+        for current_id, task in self.tasks.items():
+            command = cast(str, task["command"])
+            status = cast(str, task["status"])
+            lines.append(f"{current_id}: [{status}] {command[:60]}")
+        return "\n".join(lines) if lines else "No background tasks."
+
+    def drain_notifications(self) -> list[dict[str, str]]:
+        with self._lock:
+            notifications = list(self._notification_queue)
+            self._notification_queue.clear()
+        return notifications
+
+
 TODO = TodoManager()
 TASKS = TaskManager(TASKS_DIR)
+BG = BackgroundManager()
 
 
 # -- 父代理与子代理共享的工具实现 --
@@ -618,7 +749,19 @@ TOOL_HANDLERS = {
     ),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(cast(TaskGetToolInput, kw)["task_id"]),
+    "background_run": lambda **kw: BG.run(cast(BackgroundRunToolInput, kw)["command"]),
+    "check_background": lambda **kw: BG.check(
+        cast(CheckBackgroundToolInput, kw).get("task_id")
+    ),
 }
+
+
+def render_background_notifications(notifications: list[dict[str, str]]) -> str:
+    lines = [
+        f"[bg:{item['task_id']}] {item['status']} | {item['command']}: {item['result']}"
+        for item in notifications
+    ]
+    return "<background-results>\n" + "\n".join(lines) + "\n</background-results>"
 
 
 def get_block_type(block: object) -> str | None:
@@ -853,6 +996,15 @@ def create_response(messages: list[MessageParam]) -> Message:
 def agent_loop(messages: list[MessageParam]) -> None:
     rounds_since_todo = 0
     while True:
+        # 清空后台通知队列，并在调用 LLM 前将其注入
+        notifications = BG.drain_notifications()
+        if notifications:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": render_background_notifications(notifications),
+                }
+            )
         # 压缩第 1 层：在每次调用 LLM 之前执行 micro_compact
         micro_compact(messages)
         # 压缩第 2 层：如果预估 Token 数超过阈值，则执行 auto_compact
