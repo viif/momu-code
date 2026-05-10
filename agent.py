@@ -1,5 +1,6 @@
-"""极简 Python Agent Harness：支持基础工具调用、todo 跟踪、skill 按需加载与 subagent 委派。"""
+"""极简 Python Agent Harness：支持基础工具调用、持久化任务、todo 跟踪、skill 按需加载、上下文压缩与 subagent 委派。"""
 
+import json
 import os
 import re
 import subprocess
@@ -28,6 +29,7 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
+TASKS_DIR = WORKDIR / ".tasks"
 
 
 class SkillMeta(TypedDict):
@@ -100,8 +102,9 @@ def build_system_prompt(base: str) -> str:
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 SYSTEM = build_system_prompt(
     f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
-    "Act, don't explain. Use the todo tool to plan multi-step tasks. "
-    "Use the task tool to delegate exploration or scoped subtasks. "
+    "Act, don't explain. Use the todo tool to plan current session work. "
+    "Use task_* tools to manage persistent tasks across conversations. "
+    "Use the subagent tool to delegate exploration or scoped subtasks. "
     "Mark in_progress before starting and completed when done. "
 )
 SUBAGENT_SYSTEM = build_system_prompt(
@@ -110,7 +113,14 @@ SUBAGENT_SYSTEM = build_system_prompt(
 )
 COMPACT_THRESHOLD = 50000
 COMPACT_KEEP_RECENT_RESULTS = 3
-COMPACT_PRESERVE_RESULT_TOOLS = {"read_file", "load_skill", "todo", "task"}
+COMPACT_PRESERVE_RESULT_TOOLS = {
+    "read_file",
+    "load_skill",
+    "todo",
+    "task_list",
+    "task_get",
+    "subagent",
+}
 ENABLE_SUBAGENT_AUTO_COMPACT = False
 
 
@@ -134,9 +144,25 @@ class EditToolInput(TypedDict):
     new_text: str
 
 
-class TaskToolInput(TypedDict):
+class SubagentToolInput(TypedDict):
     prompt: str
     description: NotRequired[str]
+
+
+class TaskCreateToolInput(TypedDict):
+    subject: str
+    description: NotRequired[str]
+
+
+class TaskUpdateToolInput(TypedDict):
+    task_id: int
+    status: NotRequired[Literal["pending", "in_progress", "completed"]]
+    addBlockedBy: NotRequired[list[int]]
+    removeBlockedBy: NotRequired[list[int]]
+
+
+class TaskGetToolInput(TypedDict):
+    task_id: int
 
 
 class LoadSkillToolInput(TypedDict):
@@ -238,7 +264,7 @@ BASE_TOOLS: list[ToolParam] = [
 
 TODO_TOOL: ToolParam = {
     "name": "todo",
-    "description": "Update task list. Track progress on multi-step tasks.",
+    "description": "Update the session todo list for current execution progress.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -262,8 +288,58 @@ TODO_TOOL: ToolParam = {
     },
 }
 
-TASK_TOOL: ToolParam = {
-    "name": "task",
+TASK_CREATE_TOOL: ToolParam = {
+    "name": "task_create",
+    "description": "Create a persistent task that survives compression and restarts.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string"},
+            "description": {"type": "string"},
+        },
+        "required": ["subject"],
+    },
+}
+
+TASK_UPDATE_TOOL: ToolParam = {
+    "name": "task_update",
+    "description": "Update a persistent task status or dependencies.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "integer"},
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "completed"],
+            },
+            "addBlockedBy": {"type": "array", "items": {"type": "integer"}},
+            "removeBlockedBy": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+        },
+        "required": ["task_id"],
+    },
+}
+
+TASK_LIST_TOOL: ToolParam = {
+    "name": "task_list",
+    "description": "List all persistent tasks with status summary.",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+TASK_GET_TOOL: ToolParam = {
+    "name": "task_get",
+    "description": "Get full details of a persistent task by ID.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"task_id": {"type": "integer"}},
+        "required": ["task_id"],
+    },
+}
+
+SUBAGENT_TOOL: ToolParam = {
+    "name": "subagent",
     "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
     "input_schema": {
         "type": "object",
@@ -278,9 +354,17 @@ TASK_TOOL: ToolParam = {
     },
 }
 
-# 父代理可用所有工具，子代理不可用 task 工具以避免无限递归
+# 父代理可用所有工具，子代理不可用 subagent 与持久化 task 工具以避免递归与状态混乱
 CHILD_TOOLS: list[ToolParam] = [*BASE_TOOLS]
-PARENT_TOOLS: list[ToolParam] = [*BASE_TOOLS, TODO_TOOL, TASK_TOOL]
+PARENT_TOOLS: list[ToolParam] = [
+    *BASE_TOOLS,
+    TODO_TOOL,
+    TASK_CREATE_TOOL,
+    TASK_UPDATE_TOOL,
+    TASK_LIST_TOOL,
+    TASK_GET_TOOL,
+    SUBAGENT_TOOL,
+]
 
 
 # -- 待办管理器：大语言模型写入的结构化状态 --
@@ -338,7 +422,104 @@ class TodoManager:
         return "\n".join(lines)
 
 
+# -- 任务管理器：带有依赖图的增删改查，以 JSON 文件形式持久化 --
+class TaskManager:
+    def __init__(self, tasks_dir: Path) -> None:
+        self.dir = tasks_dir
+        self.dir.mkdir(exist_ok=True)
+        self._next_id = self._max_id() + 1
+
+    def _max_id(self) -> int:
+        ids = [
+            int(file_path.stem.split("_")[1])
+            for file_path in self.dir.glob("task_*.json")
+        ]
+        return max(ids) if ids else 0
+
+    def _load(self, task_id: int) -> dict[str, object]:
+        path = self.dir / f"task_{task_id}.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        return cast(dict[str, object], json.loads(path.read_text()))
+
+    def _save(self, task: dict[str, object]) -> None:
+        path = self.dir / f"task_{task['id']}.json"
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+
+    def create(self, subject: str, description: str = "") -> str:
+        task = {
+            "id": self._next_id,
+            "subject": subject,
+            "description": description,
+            "status": "pending",
+            "blockedBy": [],
+            "owner": "",
+        }
+        self._save(task)
+        self._next_id += 1
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def get(self, task_id: int) -> str:
+        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
+
+    def update(
+        self,
+        task_id: int,
+        status: str | None = None,
+        add_blocked_by: list[int] | None = None,
+        remove_blocked_by: list[int] | None = None,
+    ) -> str:
+        task = self._load(task_id)
+        if status:
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Invalid status: {status}")
+            task["status"] = status
+            if status == "completed":
+                self._clear_dependency(task_id)
+        if add_blocked_by:
+            blocked_by = cast(list[int], task["blockedBy"])
+            task["blockedBy"] = list(set(blocked_by + add_blocked_by))
+        if remove_blocked_by:
+            blocked_by = cast(list[int], task["blockedBy"])
+            task["blockedBy"] = [x for x in blocked_by if x not in remove_blocked_by]
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def _clear_dependency(self, completed_id: int) -> None:
+        for file_path in self.dir.glob("task_*.json"):
+            task = cast(dict[str, object], json.loads(file_path.read_text()))
+            blocked_by = cast(list[int], task.get("blockedBy", []))
+            if completed_id in blocked_by:
+                blocked_by.remove(completed_id)
+                task["blockedBy"] = blocked_by
+                self._save(task)
+
+    def list_all(self) -> str:
+        tasks: list[dict[str, object]] = []
+        files = sorted(
+            self.dir.glob("task_*.json"),
+            key=lambda file_path: int(file_path.stem.split("_")[1]),
+        )
+        for file_path in files:
+            tasks.append(cast(dict[str, object], json.loads(file_path.read_text())))
+        if not tasks:
+            return "No tasks."
+        lines: list[str] = []
+        for task in tasks:
+            marker = {
+                "pending": "[ ]",
+                "in_progress": "[>]",
+                "completed": "[x]",
+            }.get(cast(str, task["status"]), "[?]")
+            blocked = (
+                f" (blocked by: {task['blockedBy']})" if task.get("blockedBy") else ""
+            )
+            lines.append(f"{marker} #{task['id']}: {task['subject']}{blocked}")
+        return "\n".join(lines)
+
+
 TODO = TodoManager()
+TASKS = TaskManager(TASKS_DIR)
 
 
 # -- 父代理与子代理共享的工具实现 --
@@ -425,6 +606,18 @@ TOOL_HANDLERS = {
     ),
     "compact": lambda **kw: "Manual compression requested.",
     "todo": lambda **kw: TODO.update(cast(TodoToolInput, kw)["items"]),
+    "task_create": lambda **kw: TASKS.create(
+        cast(TaskCreateToolInput, kw)["subject"],
+        cast(TaskCreateToolInput, kw).get("description", ""),
+    ),
+    "task_update": lambda **kw: TASKS.update(
+        cast(TaskUpdateToolInput, kw)["task_id"],
+        cast(TaskUpdateToolInput, kw).get("status"),
+        cast(TaskUpdateToolInput, kw).get("addBlockedBy"),
+        cast(TaskUpdateToolInput, kw).get("removeBlockedBy"),
+    ),
+    "task_list": lambda **kw: TASKS.list_all(),
+    "task_get": lambda **kw: TASKS.get(cast(TaskGetToolInput, kw)["task_id"]),
 }
 
 
@@ -603,9 +796,14 @@ def run_subagent(prompt: str) -> str:
                     manual_compact = True
                     compact_focus = cast(CompactToolInput, block.input).get("focus")
                 handler = TOOL_HANDLERS.get(block.name)
-                output = (
-                    handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                )
+                try:
+                    output = (
+                        handler(**block.input)
+                        if handler
+                        else f"Unknown tool: {block.name}"
+                    )
+                except Exception as e:
+                    output = f"Error: {e}"
                 results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": output}
                 )
@@ -622,17 +820,20 @@ def run_subagent(prompt: str) -> str:
 
 def execute_tool_block(block: ToolUseBlock) -> ToolResultBlockParam:
     handler = TOOL_HANDLERS.get(block.name)
-    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+    try:
+        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+    except Exception as e:
+        output = f"Error: {e}"
     print(f"> {block.name}:")
     print(output[:200])
     return {"type": "tool_result", "tool_use_id": block.id, "content": output}
 
 
-def execute_task_block(block: ToolUseBlock) -> ToolResultBlockParam:
-    task_input = cast(TaskToolInput, block.input)
+def execute_subagent_block(block: ToolUseBlock) -> ToolResultBlockParam:
+    task_input = cast(SubagentToolInput, block.input)
     description = task_input.get("description", "subtask")
     prompt = task_input["prompt"]
-    print(f"> task ({description}):")
+    print(f"> subagent ({description}):")
     output = run_subagent(prompt)
     print(output[:200])
     return {"type": "tool_result", "tool_use_id": block.id, "content": output}
@@ -673,9 +874,9 @@ def agent_loop(messages: list[MessageParam]) -> None:
                 if block.name == "compact":
                     manual_compact = True
                     compact_focus = cast(CompactToolInput, block.input).get("focus")
-                if block.name == "task":
-                    # 任务工具需要特殊处理，调用子代理
-                    results.append(execute_task_block(block))
+                if block.name == "subagent":
+                    # subagent 工具需要特殊处理，调用子代理
+                    results.append(execute_subagent_block(block))
                 else:
                     results.append(execute_tool_block(block))
                 if block.name == "todo":
