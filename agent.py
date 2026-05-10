@@ -44,6 +44,9 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
 TASKS_DIR = WORKDIR / ".tasks"
+TEAM_DIR = WORKDIR / ".team"
+INBOX_DIR = TEAM_DIR / "inbox"
+VALID_MSG_TYPES = {"message"}
 
 
 class SkillMeta(TypedDict):
@@ -121,11 +124,17 @@ SYSTEM = build_system_prompt(
     "Use background_run for long-running shell commands and check_background to inspect them. "
     "Background task completions are delivered in <background-results>. "
     "Use the subagent tool to delegate exploration or scoped subtasks. "
+    "Use spawn_teammate to create named teammates and use send_message/read_inbox to coordinate through inboxes. "
+    "Teammate messages arrive in <inbox>. "
     "Mark in_progress before starting and completed when done. "
 )
 SUBAGENT_SYSTEM = build_system_prompt(
     f"You are a coding subagent at {WORKDIR}. Complete the given task "
     "with fresh context, then return a concise summary. "
+)
+TEAMMATE_SYSTEM = build_system_prompt(
+    f"You are a coding teammate at {WORKDIR}. Complete the assigned task, "
+    "use send_message to report back to lead or other teammates, and check read_inbox for follow-up messages. "
 )
 COMPACT_THRESHOLD = 50000
 COMPACT_KEEP_RECENT_RESULTS = 3
@@ -196,6 +205,21 @@ class LoadSkillToolInput(TypedDict):
 
 class CompactToolInput(TypedDict):
     focus: NotRequired[str]
+
+
+class SpawnTeammateToolInput(TypedDict):
+    name: str
+    role: str
+    prompt: str
+
+
+class SendMessageToolInput(TypedDict):
+    to: str
+    content: str
+
+
+class ReadInboxToolInput(TypedDict):
+    pass
 
 
 TodoStatus = Literal["pending", "in_progress", "completed"]
@@ -398,8 +422,52 @@ SUBAGENT_TOOL: ToolParam = {
     },
 }
 
+SPAWN_TEAMMATE_TOOL: ToolParam = {
+    "name": "spawn_teammate",
+    "description": "Spawn a named teammate that can report back through inbox messages.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "role": {"type": "string"},
+            "prompt": {"type": "string"},
+        },
+        "required": ["name", "role", "prompt"],
+    },
+}
+
+LIST_TEAMMATES_TOOL: ToolParam = {
+    "name": "list_teammates",
+    "description": "List all teammates with their role and status.",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+SEND_MESSAGE_TOOL: ToolParam = {
+    "name": "send_message",
+    "description": "Send a message to a teammate inbox.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "to": {"type": "string"},
+            "content": {"type": "string"},
+        },
+        "required": ["to", "content"],
+    },
+}
+
+READ_INBOX_TOOL: ToolParam = {
+    "name": "read_inbox",
+    "description": "Read and drain your inbox.",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
 # 父代理可用所有工具，子代理不可用 subagent 与持久化 task 工具以避免递归与状态混乱
 CHILD_TOOLS: list[ToolParam] = [*BASE_TOOLS]
+TEAMMATE_TOOLS: list[ToolParam] = [
+    *BASE_TOOLS,
+    SEND_MESSAGE_TOOL,
+    READ_INBOX_TOOL,
+]
 PARENT_TOOLS: list[ToolParam] = [
     *BASE_TOOLS,
     TODO_TOOL,
@@ -410,6 +478,10 @@ PARENT_TOOLS: list[ToolParam] = [
     BACKGROUND_RUN_TOOL,
     CHECK_BACKGROUND_TOOL,
     SUBAGENT_TOOL,
+    SPAWN_TEAMMATE_TOOL,
+    LIST_TEAMMATES_TOOL,
+    SEND_MESSAGE_TOOL,
+    READ_INBOX_TOOL,
 ]
 
 
@@ -486,11 +558,18 @@ class TaskManager:
         path = self.dir / f"task_{task_id}.json"
         if not path.exists():
             raise ValueError(f"Task {task_id} not found")
-        return cast(dict[str, object], json.loads(path.read_text()))
+        return cast(
+            dict[str, object],
+            json.loads(path.read_text(encoding="utf-8", errors="replace")),
+        )
 
     def _save(self, task: dict[str, object]) -> None:
         path = self.dir / f"task_{task['id']}.json"
-        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+        path.write_text(
+            json.dumps(task, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+            errors="replace",
+        )
 
     def create(self, subject: str, description: str = "") -> str:
         task = {
@@ -533,7 +612,10 @@ class TaskManager:
 
     def _clear_dependency(self, completed_id: int) -> None:
         for file_path in self.dir.glob("task_*.json"):
-            task = cast(dict[str, object], json.loads(file_path.read_text()))
+            task = cast(
+                dict[str, object],
+                json.loads(file_path.read_text(encoding="utf-8", errors="replace")),
+            )
             blocked_by = cast(list[int], task.get("blockedBy", []))
             if completed_id in blocked_by:
                 blocked_by.remove(completed_id)
@@ -659,9 +741,220 @@ class BackgroundManager:
         return notifications
 
 
+# -- 消息总线：每位队友一个 JSONL 格式的收件箱 --
+class MessageBus:
+    def __init__(self, inbox_dir: Path) -> None:
+        self.dir = inbox_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def send(
+        self, sender: str, to: str, content: str, msg_type: str = "message"
+    ) -> str:
+        if msg_type not in VALID_MSG_TYPES:
+            return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+        msg = {
+            "type": msg_type,
+            "from": sender,
+            "content": content,
+            "timestamp": time.time(),
+        }
+        inbox_path = self.dir / f"{to}.jsonl"
+        with inbox_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        return f"Sent {msg_type} to {to}"
+
+    def read_inbox(self, name: str) -> list[dict[str, object]]:
+        inbox_path = self.dir / f"{name}.jsonl"
+        if not inbox_path.exists():
+            return []
+        messages: list[dict[str, object]] = []
+        text = inbox_path.read_text(encoding="utf-8", errors="replace")
+        for line in text.strip().splitlines():
+            if line:
+                messages.append(cast(dict[str, object], json.loads(line)))
+        inbox_path.write_text("", encoding="utf-8", errors="replace")
+        return messages
+
+
+# -- 队友管理器：基于 config.json 持久化存储的命名智能体 --
+class TeammateManager:
+    def __init__(self, team_dir: Path) -> None:
+        self.dir = team_dir
+        self.dir.mkdir(exist_ok=True)
+        self.config_path = self.dir / "config.json"
+        self.config = self._load_config()
+        self.threads: dict[str, threading.Thread] = {}
+
+    def _load_config(self) -> dict[str, object]:
+        if self.config_path.exists():
+            return cast(
+                dict[str, object],
+                json.loads(
+                    self.config_path.read_text(encoding="utf-8", errors="replace")
+                ),
+            )
+        return {"team_name": "default", "members": []}
+
+    def _save_config(self) -> None:
+        self.config_path.write_text(
+            json.dumps(self.config, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def _members(self) -> list[dict[str, object]]:
+        return cast(list[dict[str, object]], self.config["members"])
+
+    def _find_member(self, name: str) -> dict[str, object] | None:
+        for member in self._members():
+            if member.get("name") == name:
+                return member
+        return None
+
+    def spawn(self, name: str, role: str, prompt: str) -> str:
+        member = self._find_member(name)
+        if member:
+            if member.get("status") == "working":
+                return f"Error: '{name}' is currently working"
+            member["role"] = role
+            member["status"] = "working"
+        else:
+            member = cast(
+                dict[str, object],
+                {"name": name, "role": role, "status": "working"},
+            )
+            self._members().append(member)
+        self._save_config()
+        thread = threading.Thread(
+            target=self._teammate_loop,
+            args=(name, role, prompt),
+            daemon=True,
+        )
+        self.threads[name] = thread
+        thread.start()
+        return f"Spawned '{name}' (role: {role})"
+
+    def _set_status(self, name: str, status: str) -> None:
+        member = self._find_member(name)
+        if member:
+            member["status"] = status
+            self._save_config()
+
+    def _exec(self, sender: str, tool_name: str, args: dict[str, object]) -> str:
+        if tool_name == "bash":
+            return run_bash(cast(str, args["command"]))
+        if tool_name == "read_file":
+            return run_read(
+                cast(str, args["path"]), cast(int | None, args.get("limit"))
+            )
+        if tool_name == "write_file":
+            return run_write(cast(str, args["path"]), cast(str, args["content"]))
+        if tool_name == "edit_file":
+            return run_edit(
+                cast(str, args["path"]),
+                cast(str, args["old_text"]),
+                cast(str, args["new_text"]),
+            )
+        if tool_name == "load_skill":
+            return SKILL_LOADER.get_content(cast(str, args["name"]))
+        if tool_name == "compact":
+            return "Manual compression requested."
+        if tool_name == "send_message":
+            return BUS.send(
+                sender,
+                cast(str, args["to"]),
+                cast(str, args["content"]),
+            )
+        if tool_name == "read_inbox":
+            return json.dumps(BUS.read_inbox(sender), indent=2, ensure_ascii=False)
+        return f"Unknown tool: {tool_name}"
+
+    def _teammate_loop(self, name: str, role: str, prompt: str) -> None:
+        messages: list[MessageParam] = [{"role": "user", "content": prompt}]
+        response: Message | None = None
+        try:
+            for _ in range(30):
+                inbox = BUS.read_inbox(name)
+                if inbox:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": render_inbox_messages(inbox),
+                        }
+                    )
+                micro_compact(messages)
+                if estimate_tokens(messages) > COMPACT_THRESHOLD:
+                    auto_compact(messages, focus=f"Continue teammate {name} work")
+                response = client.messages.create(
+                    model=MODEL,
+                    system=(
+                        TEAMMATE_SYSTEM
+                        + f"\n\nYour name is {name}. Your role is {role}."
+                    ),
+                    messages=messages,
+                    tools=TEAMMATE_TOOLS,
+                    max_tokens=8000,
+                )
+                messages.append({"role": "assistant", "content": response.content})
+                if response.stop_reason != "tool_use":
+                    break
+                results: list[ToolResultBlockParam] = []
+                manual_compact = False
+                compact_focus: str | None = None
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    if block.name == "compact":
+                        manual_compact = True
+                        compact_focus = cast(CompactToolInput, block.input).get("focus")
+                    try:
+                        output = self._exec(
+                            name, block.name, cast(dict[str, object], block.input)
+                        )
+                    except Exception as e:
+                        output = f"Error: {e}"
+                    print(f"> teammate:{name} {block.name}:")
+                    print(output[:200])
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": output,
+                        }
+                    )
+                messages.append({"role": "user", "content": results})
+                if manual_compact:
+                    auto_compact(
+                        messages,
+                        compact_focus or f"Continue teammate {name} work",
+                    )
+        finally:
+            self._set_status(name, "idle")
+
+    def list_all(self) -> str:
+        members = self._members()
+        if not members:
+            return "No teammates."
+        lines = [f"Team: {self.config.get('team_name', 'default')}"]
+        for member in members:
+            lines.append(
+                f"  {member.get('name')} ({member.get('role')}): {member.get('status')}"
+            )
+        return "\n".join(lines)
+
+    def member_names(self) -> list[str]:
+        return [
+            cast(str, member.get("name"))
+            for member in self._members()
+            if member.get("name")
+        ]
+
+
 TODO = TodoManager()
 TASKS = TaskManager(TASKS_DIR)
 BG = BackgroundManager()
+BUS = MessageBus(INBOX_DIR)
+TEAM = TeammateManager(TEAM_DIR)
 
 
 # -- 父代理与子代理共享的工具实现 --
@@ -697,7 +990,7 @@ def run_bash(command: str) -> str:
 
 def run_read(path: str, limit: int | None = None) -> str:
     try:
-        text = safe_path(path).read_text()
+        text = safe_path(path).read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
@@ -710,7 +1003,7 @@ def run_write(path: str, content: str) -> str:
     try:
         file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
+        file_path.write_text(content, encoding="utf-8", errors="replace")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -719,10 +1012,14 @@ def run_write(path: str, content: str) -> str:
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         file_path = safe_path(path)
-        content = file_path.read_text()
+        content = file_path.read_text(encoding="utf-8", errors="replace")
         if old_text not in content:
             return f"Error: Text not found in {path}"
-        file_path.write_text(content.replace(old_text, new_text, 1))
+        file_path.write_text(
+            content.replace(old_text, new_text, 1),
+            encoding="utf-8",
+            errors="replace",
+        )
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -764,6 +1061,20 @@ TOOL_HANDLERS = {
     "check_background": lambda **kw: BG.check(
         cast(CheckBackgroundToolInput, kw).get("task_id")
     ),
+    "spawn_teammate": lambda **kw: TEAM.spawn(
+        cast(SpawnTeammateToolInput, kw)["name"],
+        cast(SpawnTeammateToolInput, kw)["role"],
+        cast(SpawnTeammateToolInput, kw)["prompt"],
+    ),
+    "list_teammates": lambda **kw: TEAM.list_all(),
+    "send_message": lambda **kw: BUS.send(
+        "lead",
+        cast(SendMessageToolInput, kw)["to"],
+        cast(SendMessageToolInput, kw)["content"],
+    ),
+    "read_inbox": lambda **kw: json.dumps(
+        BUS.read_inbox("lead"), indent=2, ensure_ascii=False
+    ),
 }
 
 
@@ -773,6 +1084,12 @@ def render_background_notifications(notifications: list[dict[str, str]]) -> str:
         for item in notifications
     ]
     return "<background-results>\n" + "\n".join(lines) + "\n</background-results>"
+
+
+def render_inbox_messages(messages: list[dict[str, object]]) -> str:
+    return (
+        "<inbox>\n" + json.dumps(messages, indent=2, ensure_ascii=False) + "\n</inbox>"
+    )
 
 
 def get_block_type(block: object) -> str | None:
@@ -1007,6 +1324,14 @@ def create_response(messages: list[MessageParam]) -> Message:
 def agent_loop(messages: list[MessageParam]) -> None:
     rounds_since_todo = 0
     while True:
+        inbox = BUS.read_inbox("lead")
+        if inbox:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": render_inbox_messages(inbox),
+                }
+            )
         # 清空后台通知队列，并在调用 LLM 前将其注入
         notifications = BG.drain_notifications()
         if notifications:
