@@ -14,10 +14,6 @@
 - plan approval / shutdown 协议
 - 基于 git worktree 的隔离执行
 
-## 环境要求
-
-- Python >= 3.13
-
 ## 安装依赖
 
 ```bash
@@ -33,10 +29,10 @@ uv sync
 
 程序会自动从 `.env` 加载环境变量。当前需要关注的变量有：
 
+- `ANTHROPIC_API_KEY`
+  - 必填，用于身份认证。
 - `MODEL_ID`
   - 必填，用于指定调用的模型 ID。
-- `ANTHROPIC_API_KEY`
-  - 直连 Anthropic 官方 API 时通常必填，用于身份认证。
 - `ANTHROPIC_BASE_URL`
   - 选填，用于指定自定义 API Base URL。
 
