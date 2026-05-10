@@ -9,6 +9,7 @@
 - 上下文压缩
 - 持久化任务系统
 - 后台任务
+- 自治智能体团队
 """
 
 import json
@@ -148,9 +149,12 @@ TEAMMATE_SYSTEM = build_system_prompt(
     f"You are a coding teammate at {WORKDIR}. Complete the assigned task, "
     "use send_message to report back to lead or other teammates, and check read_inbox for follow-up messages. "
     "Submit plans via plan_approval before major work and respond to shutdown_request with shutdown_response. "
+    "Use idle when you have no more work; the harness will poll for inbox messages and auto-claim new tasks for you. "
 )
 COMPACT_THRESHOLD = 50000
 COMPACT_KEEP_RECENT_RESULTS = 3
+POLL_INTERVAL = 5
+IDLE_TIMEOUT = 60
 COMPACT_PRESERVE_RESULT_TOOLS = {
     "read_file",
     "load_skill",
@@ -255,6 +259,10 @@ class PlanApprovalToolInput(TypedDict):
 
 class ReadInboxToolInput(TypedDict):
     pass
+
+
+class ClaimTaskToolInput(TypedDict):
+    task_id: int
 
 
 TodoStatus = Literal["pending", "in_progress", "completed"]
@@ -545,6 +553,22 @@ PLAN_APPROVAL_TOOL: ToolParam = {
     },
 }
 
+IDLE_TOOL: ToolParam = {
+    "name": "idle",
+    "description": "Signal that you have no more work and enter idle polling mode.",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+CLAIM_TASK_TOOL: ToolParam = {
+    "name": "claim_task",
+    "description": "Claim a persistent task by ID and mark it in progress.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"task_id": {"type": "integer"}},
+        "required": ["task_id"],
+    },
+}
+
 # 父代理可用所有工具，子代理不可用 subagent 与持久化 task 工具以避免递归与状态混乱
 CHILD_TOOLS: list[ToolParam] = [*BASE_TOOLS]
 TEAMMATE_TOOLS: list[ToolParam] = [
@@ -553,6 +577,8 @@ TEAMMATE_TOOLS: list[ToolParam] = [
     READ_INBOX_TOOL,
     SHUTDOWN_RESPONSE_TOOL,
     PLAN_APPROVAL_TOOL,
+    IDLE_TOOL,
+    CLAIM_TASK_TOOL,
 ]
 PARENT_TOOLS: list[ToolParam] = [
     *BASE_TOOLS,
@@ -572,6 +598,8 @@ PARENT_TOOLS: list[ToolParam] = [
     SHUTDOWN_REQUEST_TOOL,
     SHUTDOWN_RESPONSE_TOOL,
     PLAN_APPROVAL_TOOL,
+    IDLE_TOOL,
+    CLAIM_TASK_TOOL,
 ]
 
 
@@ -636,6 +664,7 @@ class TaskManager:
         self.dir = tasks_dir
         self.dir.mkdir(exist_ok=True)
         self._next_id = self._max_id() + 1
+        self._claim_lock = threading.Lock()
 
     def _max_id(self) -> int:
         ids = [
@@ -700,6 +729,42 @@ class TaskManager:
         self._save(task)
         return json.dumps(task, indent=2, ensure_ascii=False)
 
+    # -- 任务面板扫描 --
+    def scan_unclaimed(self) -> list[dict[str, object]]:
+        tasks: list[dict[str, object]] = []
+        files = sorted(
+            self.dir.glob("task_*.json"),
+            key=lambda file_path: int(file_path.stem.split("_")[1]),
+        )
+        for file_path in files:
+            task = cast(
+                dict[str, object],
+                json.loads(file_path.read_text(encoding="utf-8", errors="replace")),
+            )
+            if (
+                task.get("status") == "pending"
+                and not task.get("owner")
+                and not task.get("blockedBy")
+            ):
+                tasks.append(task)
+        return tasks
+
+    def claim(self, task_id: int, owner: str) -> str:
+        with self._claim_lock:
+            task = self._load(task_id)
+            existing_owner = cast(str, task.get("owner", ""))
+            if existing_owner:
+                return f"Error: Task {task_id} has already been claimed by {existing_owner}"
+            status = cast(str, task.get("status", "pending"))
+            if status != "pending":
+                return f"Error: Task {task_id} cannot be claimed because its status is '{status}'"
+            if task.get("blockedBy"):
+                return f"Error: Task {task_id} is blocked by other task(s) and cannot be claimed yet"
+            task["owner"] = owner
+            task["status"] = "in_progress"
+            self._save(task)
+        return f"Claimed task #{task_id} for {owner}"
+
     def _clear_dependency(self, completed_id: int) -> None:
         for file_path in self.dir.glob("task_*.json"):
             task = cast(
@@ -732,7 +797,8 @@ class TaskManager:
             blocked = (
                 f" (blocked by: {task['blockedBy']})" if task.get("blockedBy") else ""
             )
-            lines.append(f"{marker} #{task['id']}: {task['subject']}{blocked}")
+            owner = f" @{task['owner']}" if task.get("owner") else ""
+            lines.append(f"{marker} #{task['id']}: {task['subject']}{owner}{blocked}")
         return "\n".join(lines)
 
 
@@ -881,7 +947,36 @@ class MessageBus:
         return f"Broadcast to {count} teammates"
 
 
-# -- 队友管理器：基于 config.json 持久化存储的命名智能体，支持协议关闭与计划审批 --
+# -- 上下文压缩后的身份重注 --
+def make_identity_block(name: str, role: str, team_name: str) -> MessageParam:
+    return {
+        "role": "user",
+        "content": (
+            f"<identity>You are '{name}', role: {role}, team: {team_name}. "
+            "Continue your work.</identity>"
+        ),
+    }
+
+
+def should_reinject_identity(messages: list[MessageParam]) -> bool:
+    if len(messages) <= 3:
+        return True
+    first_content = messages[0].get("content") if messages else None
+    return isinstance(first_content, str) and first_content.startswith(
+        "[Conversation compressed"
+    )
+
+
+def apply_identity_reinjection(
+    messages: list[MessageParam], name: str, role: str, team_name: str
+) -> None:
+    if not should_reinject_identity(messages):
+        return
+    messages.insert(0, make_identity_block(name, role, team_name))
+    messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
+
+
+# -- 自治队友管理器：基于 config.json 持久化存储的命名智能体，支持协议关闭与计划审批，可自动认领任务并执行 --
 class TeammateManager:
     def __init__(self, team_dir: Path) -> None:
         self.dir = team_dir
@@ -965,6 +1060,10 @@ class TeammateManager:
             return SKILL_LOADER.get_content(cast(str, args["name"]))
         if tool_name == "compact":
             return "Manual compression requested."
+        if tool_name == "idle":
+            return "Entering idle phase. Will poll for inbox messages and new tasks."
+        if tool_name == "claim_task":
+            return TASKS.claim(cast(ClaimTaskToolInput, args)["task_id"], sender)
         if tool_name == "send_message":
             return BUS.send(
                 sender,
@@ -1013,73 +1112,141 @@ class TeammateManager:
         return f"Unknown tool: {tool_name}"
 
     def _teammate_loop(self, name: str, role: str, prompt: str) -> None:
+        team_name = cast(str, self.config.get("team_name", "default"))
         messages: list[MessageParam] = [{"role": "user", "content": prompt}]
-        response: Message | None = None
         should_exit = False
+
         try:
-            for _ in range(30):
-                inbox = BUS.read_inbox(name)
-                if inbox:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": render_inbox_messages(inbox),
-                        }
-                    )
-                if should_exit:
-                    break
-                micro_compact(messages)
-                if estimate_tokens(messages) > COMPACT_THRESHOLD:
-                    auto_compact(messages, focus=f"Continue teammate {name} work")
-                response = client.messages.create(
-                    model=MODEL,
-                    system=(
-                        TEAMMATE_SYSTEM
-                        + f"\n\nYour name is {name}. Your role is {role}."
-                    ),
-                    messages=messages,
-                    tools=TEAMMATE_TOOLS,
-                    max_tokens=8000,
-                )
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
-                    break
-                results: list[ToolResultBlockParam] = []
-                manual_compact = False
-                compact_focus: str | None = None
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    if block.name == "compact":
-                        manual_compact = True
-                        compact_focus = cast(CompactToolInput, block.input).get("focus")
-                    try:
-                        output = self._exec(
-                            name, block.name, cast(dict[str, object], block.input)
+            while True:
+                # -- 工作阶段：标准智能体循环 --
+                idle_requested = False
+                for _ in range(50):
+                    inbox = BUS.read_inbox(name)
+                    for msg in inbox:
+                        if msg.get("type") == "shutdown_request":
+                            self._set_status(name, "shutdown")
+                            return
+                    if inbox:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": render_inbox_messages(inbox),
+                            }
                         )
-                    except Exception as e:
-                        output = f"Error: {e}"
-                    print(f"> teammate:{name} {block.name}:")
-                    print(output[:200])
-                    results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": output,
-                        }
+                    micro_compact(messages)
+                    if estimate_tokens(messages) > COMPACT_THRESHOLD:
+                        auto_compact(messages, focus=f"Continue teammate {name} work")
+                    response = client.messages.create(
+                        model=MODEL,
+                        system=(
+                            TEAMMATE_SYSTEM
+                            + f"\n\nYour name is {name}. Your role is {role}. Team: {team_name}."
+                        ),
+                        messages=messages,
+                        tools=TEAMMATE_TOOLS,
+                        max_tokens=8000,
                     )
-                    if block.name == "shutdown_response" and cast(
-                        bool | None, block.input.get("approve")
-                    ):
-                        should_exit = True
-                messages.append({"role": "user", "content": results})
-                if manual_compact:
-                    auto_compact(
-                        messages,
-                        compact_focus or f"Continue teammate {name} work",
-                    )
+                    messages.append({"role": "assistant", "content": response.content})
+                    if response.stop_reason != "tool_use":
+                        break
+
+                    results: list[ToolResultBlockParam] = []
+                    manual_compact = False
+                    compact_focus: str | None = None
+                    for block in response.content:
+                        if block.type != "tool_use":
+                            continue
+                        if block.name == "compact":
+                            manual_compact = True
+                            compact_focus = cast(CompactToolInput, block.input).get(
+                                "focus"
+                            )
+                        if block.name == "idle":
+                            idle_requested = True
+                        try:
+                            output = self._exec(
+                                name, block.name, cast(dict[str, object], block.input)
+                            )
+                        except Exception as e:
+                            output = f"Error: {e}"
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": output,
+                            }
+                        )
+                        if block.name == "shutdown_response" and cast(
+                            bool | None, block.input.get("approve")
+                        ):
+                            should_exit = True
+                    messages.append({"role": "user", "content": results})
+                    if manual_compact:
+                        auto_compact(
+                            messages,
+                            compact_focus or f"Continue teammate {name} work",
+                        )
+                    if should_exit or idle_requested:
+                        break
+
+                if should_exit:
+                    self._set_status(name, "shutdown")
+                    return
+
+                # -- 空闲阶段：轮询收件箱消息与未认领任务 --
+                self._set_status(name, "idle")
+                resume = False
+                polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
+                for _ in range(polls):
+                    time.sleep(POLL_INTERVAL)
+                    inbox = BUS.read_inbox(name)
+                    for msg in inbox:
+                        if msg.get("type") == "shutdown_request":
+                            self._set_status(name, "shutdown")
+                            return
+                    if inbox:
+                        apply_identity_reinjection(messages, name, role, team_name)
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": render_inbox_messages(inbox),
+                            }
+                        )
+                        resume = True
+                        break
+
+                    unclaimed = TASKS.scan_unclaimed()
+                    if unclaimed:
+                        task = unclaimed[0]
+                        task_id = cast(int, task["id"])
+                        result = TASKS.claim(task_id, name)
+                        if result.startswith("Error:"):
+                            continue
+                        apply_identity_reinjection(messages, name, role, team_name)
+                        task_prompt = (
+                            f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
+                            f"{task.get('description', '')}</auto-claimed>"
+                        )
+                        messages.append({"role": "user", "content": task_prompt})
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": f"Claimed task #{task['id']}. Working on it.",
+                            }
+                        )
+                        resume = True
+                        break
+
+                if not resume:
+                    self._set_status(name, "shutdown")
+                    return
+
+                self._set_status(name, "working")
         finally:
-            self._set_status(name, "shutdown" if should_exit else "idle")
+            if not should_exit:
+                member = self._find_member(name)
+                if member and member.get("status") == "working":
+                    self._set_status(name, "idle")
 
     def list_all(self) -> str:
         members = self._members()
@@ -1119,6 +1286,14 @@ def handle_shutdown_request(teammate: str) -> str:
         {"request_id": req_id},
     )
     return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+
+
+def handle_idle_tool() -> str:
+    return "Lead does not idle."
+
+
+def handle_claim_task(task_id: int, owner: str = "lead") -> str:
+    return TASKS.claim(task_id, owner)
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
@@ -1283,6 +1458,10 @@ TOOL_HANDLERS = {
         cast(str, cast(PlanApprovalToolInput, kw).get("request_id", "")),
         bool(cast(PlanApprovalToolInput, kw).get("approve", False)),
         cast(PlanApprovalToolInput, kw).get("feedback", ""),
+    ),
+    "idle": lambda **kw: handle_idle_tool(),
+    "claim_task": lambda **kw: handle_claim_task(
+        cast(ClaimTaskToolInput, kw)["task_id"]
     ),
 }
 
@@ -1599,6 +1778,15 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if query.strip() == "/team":
+            print(TEAM.list_all())
+            continue
+        if query.strip() == "/inbox":
+            print(json.dumps(BUS.read_inbox("lead"), indent=2, ensure_ascii=False))
+            continue
+        if query.strip() == "/tasks":
+            print(TASKS.list_all())
+            continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
         for text in iter_text_blocks(history[-1]["content"]):
