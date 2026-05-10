@@ -2,7 +2,7 @@
 极简 Python Agent Harness
 
 支持：
-- 基础 Bash 工具调用
+- 基础 bash 工具调用
 - todo 跟踪
 - subagent 委派
 - skill 按需加载
@@ -10,16 +10,18 @@
 - 持久化任务系统
 - 后台任务
 - 自治智能体团队
+- 基于 worktree 的任务隔离
 """
 
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
@@ -41,11 +43,32 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
+
+
+def detect_repo_root(cwd: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        root = Path(result.stdout.strip())
+        return root if root.exists() else None
+    except Exception:
+        return None
+
+
+REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
-TASKS_DIR = WORKDIR / ".tasks"
-TEAM_DIR = WORKDIR / ".team"
+TASKS_DIR = REPO_ROOT / ".tasks"
+TEAM_DIR = REPO_ROOT / ".team"
+WORKTREES_DIR = REPO_ROOT / ".worktrees"
 INBOX_DIR = TEAM_DIR / "inbox"
 VALID_MSG_TYPES = {
     "message",
@@ -133,6 +156,7 @@ SYSTEM = build_system_prompt(
     f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
     "Act, don't explain. Use the todo tool to plan current session work. "
     "Use task_* tools to manage persistent tasks across conversations. "
+    "For parallel or risky changes, create tasks and use worktree_* tools to isolate execution lanes when needed. "
     "Use background_run for long-running shell commands and check_background to inspect them. "
     "Background task completions are delivered in <background-results>. "
     "Use the subagent tool to delegate exploration or scoped subtasks. "
@@ -149,6 +173,7 @@ TEAMMATE_SYSTEM = build_system_prompt(
     f"You are a coding teammate at {WORKDIR}. Complete the assigned task, "
     "use send_message to report back to lead or other teammates, and check read_inbox for follow-up messages. "
     "Submit plans via plan_approval before major work and respond to shutdown_request with shutdown_response. "
+    "Use worktree_run/worktree_status when a task is assigned to a worktree lane. "
     "Use idle when you have no more work; the harness will poll for inbox messages and auto-claim new tasks for you. "
 )
 COMPACT_THRESHOLD = 50000
@@ -259,6 +284,36 @@ class PlanApprovalToolInput(TypedDict):
 
 class ReadInboxToolInput(TypedDict):
     pass
+
+
+class TaskBindWorktreeToolInput(TypedDict):
+    task_id: int
+    worktree: str
+
+
+class WorktreeCreateToolInput(TypedDict):
+    name: str
+    task_id: NotRequired[int]
+    base_ref: NotRequired[str]
+
+
+class WorktreeNameToolInput(TypedDict):
+    name: str
+
+
+class WorktreeRunToolInput(TypedDict):
+    name: str
+    command: str
+
+
+class WorktreeRemoveToolInput(TypedDict):
+    name: str
+    force: NotRequired[bool]
+    complete_task: NotRequired[bool]
+
+
+class WorktreeEventsToolInput(TypedDict):
+    limit: NotRequired[int]
 
 
 class ClaimTaskToolInput(TypedDict):
@@ -559,6 +614,95 @@ IDLE_TOOL: ToolParam = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
+TASK_BIND_WORKTREE_TOOL: ToolParam = {
+    "name": "task_bind_worktree",
+    "description": "Bind a persistent task to a worktree lane.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "integer"},
+            "worktree": {"type": "string"},
+        },
+        "required": ["task_id", "worktree"],
+    },
+}
+
+WORKTREE_CREATE_TOOL: ToolParam = {
+    "name": "worktree_create",
+    "description": "Create a git worktree and optionally bind it to a task.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "task_id": {"type": "integer"},
+            "base_ref": {"type": "string"},
+        },
+        "required": ["name"],
+    },
+}
+
+WORKTREE_LIST_TOOL: ToolParam = {
+    "name": "worktree_list",
+    "description": "List tracked worktrees.",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+WORKTREE_STATUS_TOOL: ToolParam = {
+    "name": "worktree_status",
+    "description": "Show git status for one worktree.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    },
+}
+
+WORKTREE_RUN_TOOL: ToolParam = {
+    "name": "worktree_run",
+    "description": "Run a shell command in a named worktree.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "command": {"type": "string"},
+        },
+        "required": ["name", "command"],
+    },
+}
+
+WORKTREE_KEEP_TOOL: ToolParam = {
+    "name": "worktree_keep",
+    "description": "Mark a worktree as kept without removing it.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    },
+}
+
+WORKTREE_REMOVE_TOOL: ToolParam = {
+    "name": "worktree_remove",
+    "description": "Remove a worktree and optionally complete its bound task.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "force": {"type": "boolean"},
+            "complete_task": {"type": "boolean"},
+        },
+        "required": ["name"],
+    },
+}
+
+WORKTREE_EVENTS_TOOL: ToolParam = {
+    "name": "worktree_events",
+    "description": "List recent worktree lifecycle events.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"limit": {"type": "integer"}},
+    },
+}
+
 CLAIM_TASK_TOOL: ToolParam = {
     "name": "claim_task",
     "description": "Claim a persistent task by ID and mark it in progress.",
@@ -579,6 +723,8 @@ TEAMMATE_TOOLS: list[ToolParam] = [
     PLAN_APPROVAL_TOOL,
     IDLE_TOOL,
     CLAIM_TASK_TOOL,
+    WORKTREE_STATUS_TOOL,
+    WORKTREE_RUN_TOOL,
 ]
 PARENT_TOOLS: list[ToolParam] = [
     *BASE_TOOLS,
@@ -587,6 +733,7 @@ PARENT_TOOLS: list[ToolParam] = [
     TASK_UPDATE_TOOL,
     TASK_LIST_TOOL,
     TASK_GET_TOOL,
+    TASK_BIND_WORKTREE_TOOL,
     BACKGROUND_RUN_TOOL,
     CHECK_BACKGROUND_TOOL,
     SUBAGENT_TOOL,
@@ -600,6 +747,13 @@ PARENT_TOOLS: list[ToolParam] = [
     PLAN_APPROVAL_TOOL,
     IDLE_TOOL,
     CLAIM_TASK_TOOL,
+    WORKTREE_CREATE_TOOL,
+    WORKTREE_LIST_TOOL,
+    WORKTREE_STATUS_TOOL,
+    WORKTREE_RUN_TOOL,
+    WORKTREE_KEEP_TOOL,
+    WORKTREE_REMOVE_TOOL,
+    WORKTREE_EVENTS_TOOL,
 ]
 
 
@@ -658,7 +812,7 @@ class TodoManager:
         return "\n".join(lines)
 
 
-# -- 任务管理器：带有依赖图的增删改查，以 JSON 文件形式持久化 --
+# -- 任务管理器：带有依赖图的增删改查，以 JSON 文件形式持久化，支持可选工作区绑定 --
 class TaskManager:
     def __init__(self, tasks_dir: Path) -> None:
         self.dir = tasks_dir
@@ -677,12 +831,27 @@ class TaskManager:
         path = self.dir / f"task_{task_id}.json"
         if not path.exists():
             raise ValueError(f"Task {task_id} not found")
-        return cast(
+        task = cast(
             dict[str, object],
             json.loads(path.read_text(encoding="utf-8", errors="replace")),
         )
+        task.setdefault("blockedBy", [])
+        task.setdefault("owner", "")
+        task.setdefault("worktree", "")
+        created_at = task.get("created_at")
+        if not isinstance(created_at, (int, float)):
+            created_at = time.time()
+            task["created_at"] = created_at
+        updated_at = task.get("updated_at")
+        if not isinstance(updated_at, (int, float)):
+            task["updated_at"] = created_at
+        return task
 
     def _save(self, task: dict[str, object]) -> None:
+        now = time.time()
+        if not isinstance(task.get("created_at"), (int, float)):
+            task["created_at"] = now
+        task["updated_at"] = now
         path = self.dir / f"task_{task['id']}.json"
         path.write_text(
             json.dumps(task, indent=2, ensure_ascii=False),
@@ -698,6 +867,9 @@ class TaskManager:
             "status": "pending",
             "blockedBy": [],
             "owner": "",
+            "worktree": "",
+            "created_at": time.time(),
+            "updated_at": time.time(),
         }
         self._save(task)
         self._next_id += 1
@@ -705,6 +877,9 @@ class TaskManager:
 
     def get(self, task_id: int) -> str:
         return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
+
+    def exists(self, task_id: int) -> bool:
+        return (self.dir / f"task_{task_id}.json").exists()
 
     def update(
         self,
@@ -726,6 +901,22 @@ class TaskManager:
         if remove_blocked_by:
             blocked_by = cast(list[int], task["blockedBy"])
             task["blockedBy"] = [x for x in blocked_by if x not in remove_blocked_by]
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
+        task = self._load(task_id)
+        task["worktree"] = worktree
+        if owner:
+            task["owner"] = owner
+        if task.get("status") == "pending":
+            task["status"] = "in_progress"
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def unbind_worktree(self, task_id: int) -> str:
+        task = self._load(task_id)
+        task["worktree"] = ""
         self._save(task)
         return json.dumps(task, indent=2, ensure_ascii=False)
 
@@ -798,8 +989,319 @@ class TaskManager:
                 f" (blocked by: {task['blockedBy']})" if task.get("blockedBy") else ""
             )
             owner = f" @{task['owner']}" if task.get("owner") else ""
-            lines.append(f"{marker} #{task['id']}: {task['subject']}{owner}{blocked}")
+            worktree = f" wt={task['worktree']}" if task.get("worktree") else ""
+            lines.append(
+                f"{marker} #{task['id']}: {task['subject']}{owner}{worktree}{blocked}"
+            )
         return "\n".join(lines)
+
+
+# -- 事件总线：用于可观测性的仅追加生命周期事件 --
+class EventBus:
+    def __init__(self, event_log_path: Path) -> None:
+        self.path = event_log_path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.write_text("", encoding="utf-8", errors="replace")
+
+    def emit(
+        self,
+        event: str,
+        task: Mapping[str, object] | None = None,
+        worktree: Mapping[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "event": event,
+            "ts": time.time(),
+            "task": task or {},
+            "worktree": worktree or {},
+        }
+        if error:
+            payload["error"] = error
+        with self.path.open("a", encoding="utf-8", errors="replace") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def list_recent(self, limit: int = 20) -> str:
+        size = max(1, min(int(limit or 20), 200))
+        lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+        recent = lines[-size:]
+        items: list[dict[str, object]] = []
+        for line in recent:
+            try:
+                items.append(cast(dict[str, object], json.loads(line)))
+            except Exception:
+                items.append({"event": "parse_error", "raw": line})
+        return json.dumps(items, indent=2, ensure_ascii=False)
+
+
+# -- 工作区管理器：Git 工作区的创建/列表/运行/移除 + 生命周期索引 --
+class WorktreeManager:
+    def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus) -> None:
+        self.repo_root = repo_root
+        self.tasks = tasks
+        self.events = events
+        self.dir = repo_root / ".worktrees"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.dir / "index.json"
+        if not self.index_path.exists():
+            self.index_path.write_text(
+                json.dumps({"worktrees": []}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+                errors="replace",
+            )
+        self.git_available = self._is_git_repo()
+
+    def _is_git_repo(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=False,
+                timeout=10,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _run_git(self, args: list[str]) -> str:
+        if not self.git_available:
+            raise RuntimeError("Not in a git repository. worktree tools require git.")
+        result = subprocess.run(
+            ["git", *args],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=False,
+            timeout=120,
+        )
+        output = decode_process_output(result)
+        if result.returncode != 0:
+            raise RuntimeError(output or f"git {' '.join(args)} failed")
+        return output or "(no output)"
+
+    def _load_index(self) -> dict[str, object]:
+        return cast(
+            dict[str, object],
+            json.loads(self.index_path.read_text(encoding="utf-8", errors="replace")),
+        )
+
+    def _save_index(self, data: dict[str, object]) -> None:
+        self.index_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def _find(self, name: str) -> dict[str, object] | None:
+        idx = self._load_index()
+        for worktree in cast(list[dict[str, object]], idx.get("worktrees", [])):
+            if worktree.get("name") == name:
+                return worktree
+        return None
+
+    def _validate_name(self, name: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name or ""):
+            raise ValueError(
+                "Invalid worktree name. Use 1-40 chars: letters, numbers, ., _, -"
+            )
+
+    def create(
+        self, name: str, task_id: int | None = None, base_ref: str = "HEAD"
+    ) -> str:
+        self._validate_name(name)
+        if self._find(name):
+            raise ValueError(f"Worktree '{name}' already exists in index")
+        if task_id is not None and not self.tasks.exists(task_id):
+            raise ValueError(f"Task {task_id} not found")
+
+        path = self.dir / name
+        branch = f"wt/{name}"
+        task_ref = {"id": task_id} if task_id is not None else {}
+        self.events.emit(
+            "worktree.create.before",
+            task=task_ref,
+            worktree={"name": name, "base_ref": base_ref},
+        )
+        try:
+            self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
+            entry: dict[str, object] = {
+                "name": name,
+                "path": str(path),
+                "branch": branch,
+                "task_id": task_id,
+                "status": "active",
+                "created_at": time.time(),
+            }
+            idx = self._load_index()
+            worktrees = cast(list[dict[str, object]], idx.setdefault("worktrees", []))
+            worktrees.append(entry)
+            self._save_index(idx)
+            if task_id is not None:
+                self.tasks.bind_worktree(task_id, name)
+            self.events.emit(
+                "worktree.create.after",
+                task=task_ref,
+                worktree={
+                    "name": name,
+                    "path": str(path),
+                    "branch": branch,
+                    "status": "active",
+                },
+            )
+            return json.dumps(entry, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.events.emit(
+                "worktree.create.failed",
+                task=task_ref,
+                worktree={"name": name, "base_ref": base_ref},
+                error=str(e),
+            )
+            raise
+
+    def list_all(self) -> str:
+        idx = self._load_index()
+        worktrees = cast(list[dict[str, object]], idx.get("worktrees", []))
+        if not worktrees:
+            return "No worktrees in index."
+        lines: list[str] = []
+        for worktree in worktrees:
+            suffix = (
+                f" task={worktree['task_id']}"
+                if worktree.get("task_id") is not None
+                else ""
+            )
+            lines.append(
+                f"[{worktree.get('status', 'unknown')}] {worktree['name']} -> "
+                f"{worktree['path']} ({worktree.get('branch', '-')}){suffix}"
+            )
+        return "\n".join(lines)
+
+    def status(self, name: str) -> str:
+        worktree = self._find(name)
+        if not worktree:
+            return f"Error: Unknown worktree '{name}'"
+        path = Path(cast(str, worktree["path"]))
+        if not path.exists():
+            return f"Error: Worktree path missing: {path}"
+        result = subprocess.run(
+            ["git", "status", "--short", "--branch"],
+            cwd=path,
+            capture_output=True,
+            text=False,
+            timeout=60,
+        )
+        output = decode_process_output(result)
+        return output or "Clean worktree"
+
+    def run(self, name: str, command: str) -> str:
+        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+        if any(item in command for item in dangerous):
+            return "Error: Dangerous command blocked"
+
+        worktree = self._find(name)
+        if not worktree:
+            return f"Error: Unknown worktree '{name}'"
+        path = Path(cast(str, worktree["path"]))
+        if not path.exists():
+            return f"Error: Worktree path missing: {path}"
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=path,
+                capture_output=True,
+                text=False,
+                timeout=300,
+            )
+            output = decode_process_output(result)
+            return output[:50000] if output else "(no output)"
+        except subprocess.TimeoutExpired:
+            return "Error: Timeout (300s)"
+        except (FileNotFoundError, OSError) as e:
+            return f"Error: {e}"
+
+    def remove(
+        self, name: str, force: bool = False, complete_task: bool = False
+    ) -> str:
+        worktree = self._find(name)
+        if not worktree:
+            return f"Error: Unknown worktree '{name}'"
+
+        task_id = worktree.get("task_id")
+        task_ref = {"id": task_id} if task_id is not None else {}
+        self.events.emit(
+            "worktree.remove.before",
+            task=task_ref,
+            worktree={"name": name, "path": worktree.get("path")},
+        )
+        try:
+            args = ["worktree", "remove"]
+            if force:
+                args.append("--force")
+            args.append(cast(str, worktree["path"]))
+            self._run_git(args)
+
+            if complete_task and isinstance(task_id, int):
+                self.tasks.update(task_id, status="completed")
+                self.tasks.unbind_worktree(task_id)
+                self.events.emit(
+                    "task.completed",
+                    task={"id": task_id, "status": "completed"},
+                    worktree={"name": name},
+                )
+
+            idx = self._load_index()
+            for item in cast(list[dict[str, object]], idx.get("worktrees", [])):
+                if item.get("name") == name:
+                    item["status"] = "removed"
+                    item["removed_at"] = time.time()
+            self._save_index(idx)
+            self.events.emit(
+                "worktree.remove.after",
+                task=task_ref,
+                worktree={
+                    "name": name,
+                    "path": worktree.get("path"),
+                    "status": "removed",
+                },
+            )
+            return f"Removed worktree '{name}'"
+        except Exception as e:
+            self.events.emit(
+                "worktree.remove.failed",
+                task=task_ref,
+                worktree={"name": name, "path": worktree.get("path")},
+                error=str(e),
+            )
+            raise
+
+    def keep(self, name: str) -> str:
+        worktree = self._find(name)
+        if not worktree:
+            return f"Error: Unknown worktree '{name}'"
+
+        idx = self._load_index()
+        kept: dict[str, object] | None = None
+        for item in cast(list[dict[str, object]], idx.get("worktrees", [])):
+            if item.get("name") == name:
+                item["status"] = "kept"
+                item["kept_at"] = time.time()
+                kept = item
+        self._save_index(idx)
+        self.events.emit(
+            "worktree.keep",
+            task={"id": worktree.get("task_id")}
+            if worktree.get("task_id") is not None
+            else {},
+            worktree={"name": name, "path": worktree.get("path"), "status": "kept"},
+        )
+        return (
+            json.dumps(kept, indent=2, ensure_ascii=False)
+            if kept
+            else f"Error: Unknown worktree '{name}'"
+        )
 
 
 # -- 后台任务管理器：线程执行 shell 命令并在下一轮注入通知 --
@@ -839,13 +1341,7 @@ class BackgroundManager:
                 text=False,
                 timeout=300,
             )
-            stdout = (
-                result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
-            )
-            stderr = (
-                result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
-            )
-            output = (stdout + stderr).strip()[:50000]
+            output = decode_process_output(result)[:50000]
             status = "completed"
             returncode: int | None = result.returncode
         except subprocess.TimeoutExpired:
@@ -1064,6 +1560,13 @@ class TeammateManager:
             return "Entering idle phase. Will poll for inbox messages and new tasks."
         if tool_name == "claim_task":
             return TASKS.claim(cast(ClaimTaskToolInput, args)["task_id"], sender)
+        if tool_name == "worktree_status":
+            return WORKTREES.status(cast(WorktreeNameToolInput, args)["name"])
+        if tool_name == "worktree_run":
+            return WORKTREES.run(
+                cast(WorktreeRunToolInput, args)["name"],
+                cast(WorktreeRunToolInput, args)["command"],
+            )
         if tool_name == "send_message":
             return BUS.send(
                 sender,
@@ -1269,6 +1772,8 @@ class TeammateManager:
 
 TODO = TodoManager()
 TASKS = TaskManager(TASKS_DIR)
+EVENTS = EventBus(WORKTREES_DIR / "events.jsonl")
+WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
 BG = BackgroundManager()
 BUS = MessageBus(INBOX_DIR)
 TEAM = TeammateManager(TEAM_DIR)
@@ -1324,6 +1829,59 @@ def check_shutdown_status(request_id: str) -> str:
     return json.dumps(request, ensure_ascii=False)
 
 
+def handle_task_bind_worktree(task_id: int, worktree: str) -> str:
+    return TASKS.bind_worktree(task_id, worktree)
+
+
+def handle_worktree_create(
+    name: str, task_id: int | None = None, base_ref: str = "HEAD"
+) -> str:
+    return WORKTREES.create(name, task_id, base_ref)
+
+
+def handle_worktree_list() -> str:
+    return WORKTREES.list_all()
+
+
+def handle_worktree_status(name: str) -> str:
+    return WORKTREES.status(name)
+
+
+def handle_worktree_run(name: str, command: str) -> str:
+    return WORKTREES.run(name, command)
+
+
+def handle_worktree_keep(name: str) -> str:
+    return WORKTREES.keep(name)
+
+
+def handle_worktree_remove(
+    name: str, force: bool = False, complete_task: bool = False
+) -> str:
+    return WORKTREES.remove(name, force, complete_task)
+
+
+def handle_worktree_events(limit: int = 20) -> str:
+    return EVENTS.list_recent(limit)
+
+
+def decode_process_output(result: subprocess.CompletedProcess[bytes]) -> str:
+    stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+    stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+    return (stdout + stderr).strip()
+
+
+def safe_console_print(text: str) -> None:
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoded = text.encode("utf-8", errors="replace")
+        if hasattr(sys.stdout, "buffer"):
+            sys.stdout.buffer.write(encoded + b"\n")
+        else:
+            print(encoded.decode("utf-8", errors="replace"))
+
+
 # -- 父代理与子代理共享的工具实现 --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -1345,9 +1903,7 @@ def run_bash(command: str) -> str:
             text=False,
             timeout=120,
         )
-        stdout = r.stdout.decode("utf-8", errors="replace") if r.stdout else ""
-        stderr = r.stderr.decode("utf-8", errors="replace") if r.stderr else ""
-        out = (stdout + stderr).strip()
+        out = decode_process_output(r)
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
@@ -1424,6 +1980,10 @@ TOOL_HANDLERS = {
     ),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(cast(TaskGetToolInput, kw)["task_id"]),
+    "task_bind_worktree": lambda **kw: handle_task_bind_worktree(
+        cast(TaskBindWorktreeToolInput, kw)["task_id"],
+        cast(TaskBindWorktreeToolInput, kw)["worktree"],
+    ),
     "background_run": lambda **kw: BG.run(cast(BackgroundRunToolInput, kw)["command"]),
     "check_background": lambda **kw: BG.check(
         cast(CheckBackgroundToolInput, kw).get("task_id")
@@ -1462,6 +2022,30 @@ TOOL_HANDLERS = {
     "idle": lambda **kw: handle_idle_tool(),
     "claim_task": lambda **kw: handle_claim_task(
         cast(ClaimTaskToolInput, kw)["task_id"]
+    ),
+    "worktree_create": lambda **kw: handle_worktree_create(
+        cast(WorktreeCreateToolInput, kw)["name"],
+        cast(WorktreeCreateToolInput, kw).get("task_id"),
+        cast(WorktreeCreateToolInput, kw).get("base_ref", "HEAD"),
+    ),
+    "worktree_list": lambda **kw: handle_worktree_list(),
+    "worktree_status": lambda **kw: handle_worktree_status(
+        cast(WorktreeNameToolInput, kw)["name"]
+    ),
+    "worktree_run": lambda **kw: handle_worktree_run(
+        cast(WorktreeRunToolInput, kw)["name"],
+        cast(WorktreeRunToolInput, kw)["command"],
+    ),
+    "worktree_keep": lambda **kw: handle_worktree_keep(
+        cast(WorktreeNameToolInput, kw)["name"]
+    ),
+    "worktree_remove": lambda **kw: handle_worktree_remove(
+        cast(WorktreeRemoveToolInput, kw)["name"],
+        bool(cast(WorktreeRemoveToolInput, kw).get("force", False)),
+        bool(cast(WorktreeRemoveToolInput, kw).get("complete_task", False)),
+    ),
+    "worktree_events": lambda **kw: handle_worktree_events(
+        cast(WorktreeEventsToolInput, kw).get("limit", 20)
     ),
 }
 
@@ -1683,8 +2267,8 @@ def execute_tool_block(block: ToolUseBlock) -> ToolResultBlockParam:
         output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
     except Exception as e:
         output = f"Error: {e}"
-    print(f"> {block.name}:")
-    print(output[:200])
+    safe_console_print(f"> {block.name}:")
+    safe_console_print(output[:200])
     return {"type": "tool_result", "tool_use_id": block.id, "content": output}
 
 
@@ -1692,9 +2276,9 @@ def execute_subagent_block(block: ToolUseBlock) -> ToolResultBlockParam:
     task_input = cast(SubagentToolInput, block.input)
     description = task_input.get("description", "subtask")
     prompt = task_input["prompt"]
-    print(f"> subagent ({description}):")
+    safe_console_print(f"> subagent ({description}):")
     output = run_subagent(prompt)
-    print(output[:200])
+    safe_console_print(output[:200])
     return {"type": "tool_result", "tool_use_id": block.id, "content": output}
 
 
@@ -1790,5 +2374,5 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history)
         for text in iter_text_blocks(history[-1]["content"]):
-            print(text)
+            safe_console_print(text)
         print()
