@@ -27,7 +27,12 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = (
     f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
     "Act, don't explain. Use the todo tool to plan multi-step tasks. "
+    "Use the task tool to delegate exploration or scoped subtasks. "
     "Mark in_progress before starting and completed when done."
+)
+SUBAGENT_SYSTEM = (
+    f"You are a coding subagent at {WORKDIR}. Complete the given task "
+    "with fresh context, then return a concise summary."
 )
 
 
@@ -51,6 +56,11 @@ class EditToolInput(TypedDict):
     new_text: str
 
 
+class TaskToolInput(TypedDict):
+    prompt: str
+    description: NotRequired[str]
+
+
 TodoStatus = Literal["pending", "in_progress", "completed"]
 
 
@@ -64,7 +74,7 @@ class TodoToolInput(TypedDict):
     items: list[TodoItemInput]
 
 
-TOOLS: list[ToolParam] = [
+BASE_TOOLS: list[ToolParam] = [
     {
         "name": "bash",
         "description": "Run a shell command.",
@@ -111,32 +121,52 @@ TOOLS: list[ToolParam] = [
             "required": ["path", "old_text", "new_text"],
         },
     },
-    {
-        "name": "todo",
-        "description": "Update task list. Track progress on multi-step tasks.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "text": {"type": "string"},
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                            },
-                        },
-                        "required": ["id", "text", "status"],
-                    },
-                }
-            },
-            "required": ["items"],
-        },
-    },
 ]
+
+TODO_TOOL: ToolParam = {
+    "name": "todo",
+    "description": "Update task list. Track progress on multi-step tasks.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                        },
+                    },
+                    "required": ["id", "text", "status"],
+                },
+            }
+        },
+        "required": ["items"],
+    },
+}
+
+TASK_TOOL: ToolParam = {
+    "name": "task",
+    "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string"},
+            "description": {
+                "type": "string",
+                "description": "Short description of the task",
+            },
+        },
+        "required": ["prompt"],
+    },
+}
+
+CHILD_TOOLS: list[ToolParam] = [*BASE_TOOLS]
+PARENT_TOOLS: list[ToolParam] = [*BASE_TOOLS, TODO_TOOL, TASK_TOOL]
 
 
 class TodoManager:
@@ -213,10 +243,12 @@ def run_bash(command: str) -> str:
             shell=True,
             cwd=WORKDIR,
             capture_output=True,
-            text=True,
+            text=False,
             timeout=120,
         )
-        out = (r.stdout + r.stderr).strip()
+        stdout = r.stdout.decode("utf-8", errors="replace") if r.stdout else ""
+        stderr = r.stderr.decode("utf-8", errors="replace") if r.stderr else ""
+        out = (stdout + stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
@@ -287,10 +319,52 @@ def iter_text_blocks(content: object) -> Iterator[str]:
             yield block.text
 
 
+def run_subagent(prompt: str) -> str:
+    sub_messages: list[MessageParam] = [{"role": "user", "content": prompt}]
+    response: Message | None = None
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL,
+            system=SUBAGENT_SYSTEM,
+            messages=sub_messages,
+            tools=CHILD_TOOLS,
+            max_tokens=8000,
+        )
+        sub_messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+
+        results: list[ToolResultBlockParam] = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                output = (
+                    handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                )
+                results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
+                )
+        sub_messages.append({"role": "user", "content": results})
+
+    if response is None:
+        return "(no summary)"
+    return "".join(iter_text_blocks(response.content)) or "(no summary)"
+
+
 def execute_tool_block(block: ToolUseBlock) -> ToolResultBlockParam:
     handler = TOOL_HANDLERS.get(block.name)
     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
     print(f"> {block.name}:")
+    print(output[:200])
+    return {"type": "tool_result", "tool_use_id": block.id, "content": output}
+
+
+def execute_task_block(block: ToolUseBlock) -> ToolResultBlockParam:
+    task_input = cast(TaskToolInput, block.input)
+    description = task_input.get("description", "subtask")
+    prompt = task_input["prompt"]
+    print(f"> task ({description}):")
+    output = run_subagent(prompt)
     print(output[:200])
     return {"type": "tool_result", "tool_use_id": block.id, "content": output}
 
@@ -300,7 +374,7 @@ def create_response(messages: list[MessageParam]) -> Message:
         model=MODEL,
         system=SYSTEM,
         messages=messages,
-        tools=TOOLS,
+        tools=PARENT_TOOLS,
         max_tokens=8000,
     )
 
@@ -320,7 +394,10 @@ def agent_loop(messages: list[MessageParam]) -> None:
         used_todo = False
         for block in response.content:
             if block.type == "tool_use":
-                results.append(execute_tool_block(block))
+                if block.name == "task":
+                    results.append(execute_task_block(block))
+                else:
+                    results.append(execute_tool_block(block))
                 if block.name == "todo":
                     used_todo = True
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
