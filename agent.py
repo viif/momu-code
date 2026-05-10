@@ -142,6 +142,9 @@ class SkillLoader:
         return f'<skill name="{name}">\n{skill["body"]}\n</skill>'
 
 
+SubagentAgentType = Literal["Explore", "general-purpose"]
+
+
 # Skills 第 1 层：注入到系统提示词中的技能元数据
 def build_system_prompt(base: str) -> str:
     return (
@@ -160,15 +163,25 @@ SYSTEM = build_system_prompt(
     "Use background_run for long-running shell commands and check_background to inspect them. "
     "Background task completions are delivered in <background-results>. "
     "Use the subagent tool to delegate exploration or scoped subtasks. "
+    "Use agent_type='Explore' for read-only research and agent_type='general-purpose' only when the subagent must edit files. "
     "Use spawn_teammate to create named teammates and use send_message/read_inbox to coordinate through inboxes. "
     "Manage shutdown and plan approval workflows for teammates when needed. "
     "Teammate messages arrive in <inbox>. "
     "Mark in_progress before starting and completed when done. "
 )
-SUBAGENT_SYSTEM = build_system_prompt(
-    f"You are a coding subagent at {WORKDIR}. Complete the given task "
-    "with fresh context, then return a concise summary. "
-)
+
+
+def build_subagent_system(agent_type: SubagentAgentType) -> str:
+    if agent_type == "general-purpose":
+        mode_note = "You may edit files when needed, but keep changes minimal and scoped to the task. "
+    else:
+        mode_note = "Stay read-only: investigate, read files, and summarize findings without modifying files. "
+    return build_system_prompt(
+        f"You are a coding subagent at {WORKDIR}. Complete the given task "
+        "with fresh context, then return a concise summary. " + mode_note
+    )
+
+
 TEAMMATE_SYSTEM = build_system_prompt(
     f"You are a coding teammate at {WORKDIR}. Complete the assigned task, "
     "use send_message to report back to lead or other teammates, and check read_inbox for follow-up messages. "
@@ -223,6 +236,7 @@ class CheckBackgroundToolInput(TypedDict):
 class SubagentToolInput(TypedDict):
     prompt: str
     description: NotRequired[str]
+    agent_type: NotRequired[SubagentAgentType]
 
 
 class TaskCreateToolInput(TypedDict):
@@ -327,6 +341,7 @@ class TodoItemInput(TypedDict):
     id: str
     text: str
     status: TodoStatus
+    activeForm: NotRequired[str]
 
 
 class TodoToolInput(TypedDict):
@@ -426,6 +441,10 @@ TODO_TOOL: ToolParam = {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed"],
                         },
+                        "activeForm": {
+                            "type": "string",
+                            "description": "Present continuous status for the in_progress item",
+                        },
                     },
                     "required": ["id", "text", "status"],
                 },
@@ -514,6 +533,11 @@ SUBAGENT_TOOL: ToolParam = {
             "description": {
                 "type": "string",
                 "description": "Short description of the task",
+            },
+            "agent_type": {
+                "type": "string",
+                "enum": ["Explore", "general-purpose"],
+                "description": "Explore is read-only. general-purpose can edit files.",
             },
         },
         "required": ["prompt"],
@@ -714,7 +738,13 @@ CLAIM_TASK_TOOL: ToolParam = {
 }
 
 # 父代理可用所有工具，子代理不可用 subagent 与持久化 task 工具以避免递归与状态混乱
-CHILD_TOOLS: list[ToolParam] = [*BASE_TOOLS]
+READ_ONLY_SUBAGENT_TOOLS: list[ToolParam] = [
+    BASE_TOOLS[0],
+    BASE_TOOLS[1],
+    BASE_TOOLS[2],
+    BASE_TOOLS[5],
+]
+WRITABLE_SUBAGENT_TOOLS: list[ToolParam] = [*BASE_TOOLS]
 TEAMMATE_TOOLS: list[ToolParam] = [
     *BASE_TOOLS,
     SEND_MESSAGE_TOOL,
@@ -772,6 +802,7 @@ class TodoManager:
             item_id = str(item.get("id", str(i + 1)))
             text = str(item.get("text", "")).strip()
             status = cast(str, item.get("status", "pending")).lower()
+            active_form = str(item.get("activeForm", "")).strip()
 
             if not text:
                 raise ValueError(f"Item {item_id}: text required")
@@ -779,14 +810,17 @@ class TodoManager:
                 raise ValueError(f"Item {item_id}: invalid status '{status}'")
             if status == "in_progress":
                 in_progress_count += 1
+                if not active_form:
+                    active_form = text
 
-            validated.append(
-                {
-                    "id": item_id,
-                    "text": text,
-                    "status": cast(TodoStatus, status),
-                }
-            )
+            validated_item: TodoItemInput = {
+                "id": item_id,
+                "text": text,
+                "status": cast(TodoStatus, status),
+            }
+            if active_form:
+                validated_item["activeForm"] = active_form
+            validated.append(validated_item)
 
         if in_progress_count > 1:
             raise ValueError("Only one task can be in_progress at a time")
@@ -805,11 +839,18 @@ class TodoManager:
                 "in_progress": "[>]",
                 "completed": "[x]",
             }[item["status"]]
-            lines.append(f"{marker} #{item['id']}: {item['text']}")
+            suffix = ""
+            active_form = item.get("activeForm", "")
+            if item["status"] == "in_progress" and active_form:
+                suffix = f" <- {active_form}"
+            lines.append(f"{marker} #{item['id']}: {item['text']}{suffix}")
 
         done = sum(1 for item in self.items if item["status"] == "completed")
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
+
+    def has_open_items(self) -> bool:
+        return any(item["status"] != "completed" for item in self.items)
 
 
 # -- 任务管理器：带有依赖图的增删改查，以 JSON 文件形式持久化，支持可选工作区绑定 --
@@ -1538,81 +1579,12 @@ class TeammateManager:
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict[str, object]) -> str:
-        if tool_name == "bash":
-            return run_bash(cast(str, args["command"]))
-        if tool_name == "read_file":
-            return run_read(
-                cast(str, args["path"]), cast(int | None, args.get("limit"))
-            )
-        if tool_name == "write_file":
-            return run_write(cast(str, args["path"]), cast(str, args["content"]))
-        if tool_name == "edit_file":
-            return run_edit(
-                cast(str, args["path"]),
-                cast(str, args["old_text"]),
-                cast(str, args["new_text"]),
-            )
-        if tool_name == "load_skill":
-            return SKILL_LOADER.get_content(cast(str, args["name"]))
-        if tool_name == "compact":
-            return "Manual compression requested."
-        if tool_name == "idle":
-            return "Entering idle phase. Will poll for inbox messages and new tasks."
-        if tool_name == "claim_task":
-            return TASKS.claim(cast(ClaimTaskToolInput, args)["task_id"], sender)
-        if tool_name == "worktree_status":
-            return WORKTREES.status(cast(WorktreeNameToolInput, args)["name"])
-        if tool_name == "worktree_run":
-            return WORKTREES.run(
-                cast(WorktreeRunToolInput, args)["name"],
-                cast(WorktreeRunToolInput, args)["command"],
-            )
-        if tool_name == "send_message":
-            return BUS.send(
-                sender,
-                cast(str, args["to"]),
-                cast(str, args["content"]),
-                cast(str, args.get("msg_type", "message")),
-            )
-        if tool_name == "read_inbox":
-            return json.dumps(BUS.read_inbox(sender), indent=2, ensure_ascii=False)
-        if tool_name == "shutdown_response":
-            request_id = cast(str, args["request_id"])
-            approve = bool(args.get("approve"))
-            reason = cast(str, args.get("reason", ""))
-            with _tracker_lock:
-                if request_id in shutdown_requests:
-                    shutdown_requests[request_id]["status"] = (
-                        "approved" if approve else "rejected"
-                    )
-            BUS.send(
-                sender,
-                "lead",
-                reason,
-                "shutdown_response",
-                {"request_id": request_id, "approve": approve},
-            )
-            return f"Shutdown {'approved' if approve else 'rejected'}"
-        if tool_name == "plan_approval":
-            plan_text = cast(str, args.get("plan", ""))
-            request_id = str(uuid.uuid4())[:8]
-            with _tracker_lock:
-                plan_requests[request_id] = {
-                    "from": sender,
-                    "plan": plan_text,
-                    "status": "pending",
-                }
-            BUS.send(
-                sender,
-                "lead",
-                plan_text,
-                "plan_approval_response",
-                {"request_id": request_id, "plan": plan_text},
-            )
-            return (
-                f"Plan submitted (request_id={request_id}). Waiting for lead approval."
-            )
-        return f"Unknown tool: {tool_name}"
+        return execute_named_tool(
+            tool_name,
+            args,
+            sender=sender,
+            allowed_tools={tool["name"] for tool in TEAMMATE_TOOLS},
+        )
 
     def _teammate_loop(self, name: str, role: str, prompt: str) -> None:
         team_name = cast(str, self.config.get("team_name", "default"))
@@ -1948,6 +1920,72 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+def execute_named_tool(
+    tool_name: str,
+    args: dict[str, object],
+    *,
+    sender: str = "lead",
+    allowed_tools: set[str] | None = None,
+) -> str:
+    if allowed_tools is not None and tool_name not in allowed_tools:
+        return f"Error: Tool '{tool_name}' is not allowed in this context"
+    if tool_name == "send_message":
+        return BUS.send(
+            sender,
+            cast(str, args["to"]),
+            cast(str, args["content"]),
+            cast(str, args.get("msg_type", "message")),
+        )
+    if tool_name == "read_inbox":
+        return json.dumps(BUS.read_inbox(sender), indent=2, ensure_ascii=False)
+    if tool_name == "claim_task":
+        return TASKS.claim(cast(ClaimTaskToolInput, args)["task_id"], sender)
+    if tool_name == "shutdown_response":
+        request_id = cast(str, args["request_id"])
+        approve = bool(args.get("approve"))
+        reason = cast(str, args.get("reason", ""))
+        with _tracker_lock:
+            if request_id in shutdown_requests:
+                shutdown_requests[request_id]["status"] = (
+                    "approved" if approve else "rejected"
+                )
+        BUS.send(
+            sender,
+            "lead",
+            reason,
+            "shutdown_response",
+            {"request_id": request_id, "approve": approve},
+        )
+        return f"Shutdown {'approved' if approve else 'rejected'}"
+    if tool_name == "plan_approval":
+        if sender == "lead":
+            return handle_plan_review(
+                cast(str, args.get("request_id", "")),
+                bool(args.get("approve", False)),
+                cast(str, args.get("feedback", "")),
+            )
+        plan_text = cast(str, args.get("plan", ""))
+        request_id = str(uuid.uuid4())[:8]
+        with _tracker_lock:
+            plan_requests[request_id] = {
+                "from": sender,
+                "plan": plan_text,
+                "status": "pending",
+            }
+        BUS.send(
+            sender,
+            "lead",
+            plan_text,
+            "plan_approval_response",
+            {"request_id": request_id, "plan": plan_text},
+        )
+        return f"Plan submitted (request_id={request_id}). Waiting for lead approval."
+    handler = TOOL_HANDLERS.get(tool_name)
+    if not handler:
+        return f"Unknown tool: {tool_name}"
+    return handler(**args)
+
+
 # -- 调度映射表：{工具名称: 处理函数} --
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(cast(BashToolInput, kw)["command"]),
@@ -2095,7 +2133,7 @@ def get_block_input(block: object) -> dict[str, object]:
 
 
 def estimate_tokens(messages: list[MessageParam]) -> int:
-    return len(str(messages)) // 4
+    return len(json.dumps(messages, default=str, ensure_ascii=False)) // 4
 
 
 # 通过匹配之前的 assistant 消息中的 tool_use_id，查找每个结果对应的 tool_name
@@ -2205,10 +2243,16 @@ def iter_text_blocks(content: object) -> Iterator[str]:
 
 
 # -- 子代理：全新上下文、过滤后的工具、仅返回摘要 --
-def run_subagent(prompt: str) -> str:
+def run_subagent(
+    prompt: str,
+    agent_type: SubagentAgentType = "Explore",
+) -> str:
     sub_messages: list[MessageParam] = [
         {"role": "user", "content": prompt}
     ]  # 全新上下文
+    sub_tools = (
+        READ_ONLY_SUBAGENT_TOOLS if agent_type == "Explore" else WRITABLE_SUBAGENT_TOOLS
+    )
     response: Message | None = None
     for _ in range(30):  # 避免死循环，子代理最多调用工具30次
         # 压缩第 1 层：在每次调用 LLM 之前执行 micro_compact
@@ -2218,12 +2262,16 @@ def run_subagent(prompt: str) -> str:
             ENABLE_SUBAGENT_AUTO_COMPACT
             and estimate_tokens(sub_messages) > COMPACT_THRESHOLD
         ):
-            auto_compact(sub_messages, is_subagent=True)
+            auto_compact(
+                sub_messages,
+                focus=f"Continue {agent_type} subagent work",
+                is_subagent=True,
+            )
         response = client.messages.create(
             model=MODEL,
-            system=SUBAGENT_SYSTEM,
+            system=build_subagent_system(agent_type),
             messages=sub_messages,
-            tools=CHILD_TOOLS,
+            tools=sub_tools,
             max_tokens=8000,
         )
         sub_messages.append({"role": "assistant", "content": response.content})
@@ -2233,17 +2281,17 @@ def run_subagent(prompt: str) -> str:
         results: list[ToolResultBlockParam] = []
         manual_compact = False
         compact_focus: str | None = None
+        allowed_tool_names = {tool["name"] for tool in sub_tools}
         for block in response.content:
             if block.type == "tool_use":
                 if block.name == "compact":
                     manual_compact = True
                     compact_focus = cast(CompactToolInput, block.input).get("focus")
-                handler = TOOL_HANDLERS.get(block.name)
                 try:
-                    output = (
-                        handler(**block.input)
-                        if handler
-                        else f"Unknown tool: {block.name}"
+                    output = execute_named_tool(
+                        block.name,
+                        cast(dict[str, object], block.input),
+                        allowed_tools=allowed_tool_names,
                     )
                 except Exception as e:
                     output = f"Error: {e}"
@@ -2253,7 +2301,11 @@ def run_subagent(prompt: str) -> str:
         sub_messages.append({"role": "user", "content": results})
         # 压缩第 3 层：由 compact 工具触发的手动压缩
         if manual_compact:
-            auto_compact(sub_messages, compact_focus, is_subagent=True)
+            auto_compact(
+                sub_messages,
+                compact_focus or f"Continue {agent_type} subagent work",
+                is_subagent=True,
+            )
 
     if response is None:
         return "(no summary)"
@@ -2262,9 +2314,8 @@ def run_subagent(prompt: str) -> str:
 
 
 def execute_tool_block(block: ToolUseBlock) -> ToolResultBlockParam:
-    handler = TOOL_HANDLERS.get(block.name)
     try:
-        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+        output = execute_named_tool(block.name, cast(dict[str, object], block.input))
     except Exception as e:
         output = f"Error: {e}"
     safe_console_print(f"> {block.name}:")
@@ -2276,8 +2327,9 @@ def execute_subagent_block(block: ToolUseBlock) -> ToolResultBlockParam:
     task_input = cast(SubagentToolInput, block.input)
     description = task_input.get("description", "subtask")
     prompt = task_input["prompt"]
-    safe_console_print(f"> subagent ({description}):")
-    output = run_subagent(prompt)
+    agent_type = task_input.get("agent_type", "Explore")
+    safe_console_print(f"> subagent ({description}, {agent_type}):")
+    output = run_subagent(prompt, agent_type)
     safe_console_print(output[:200])
     return {"type": "tool_result", "tool_use_id": block.id, "content": output}
 
@@ -2342,7 +2394,7 @@ def agent_loop(messages: list[MessageParam]) -> None:
                 if block.name == "todo":
                     used_todo = True
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        if rounds_since_todo >= 3:
+        if rounds_since_todo >= 3 and TODO.has_open_items():
             # 增加催促更新进度的提醒
             results.append(
                 {"type": "text", "text": "<reminder>Update your todos.</reminder>"}
@@ -2362,6 +2414,10 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if query.strip() == "/compact":
+            if history:
+                auto_compact(history, focus="Continue the current REPL session")
+            continue
         if query.strip() == "/team":
             print(TEAM.list_all())
             continue
