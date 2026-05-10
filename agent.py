@@ -1,3 +1,5 @@
+"""极简 Python Agent Harness：支持基础工具调用、todo 跟踪与 subagent 委派。"""
+
 import os
 import subprocess
 from collections.abc import Iterator
@@ -165,10 +167,12 @@ TASK_TOOL: ToolParam = {
     },
 }
 
+# 父代理可用所有工具，子代理不可用 task 工具以避免无限递归
 CHILD_TOOLS: list[ToolParam] = [*BASE_TOOLS]
 PARENT_TOOLS: list[ToolParam] = [*BASE_TOOLS, TODO_TOOL, TASK_TOOL]
 
 
+# -- 待办管理器：大语言模型写入的结构化状态 --
 class TodoManager:
     def __init__(self) -> None:
         self.items: list[TodoItemInput] = []
@@ -226,6 +230,7 @@ class TodoManager:
 TODO = TodoManager()
 
 
+# -- 父代理与子代理共享的工具实现 --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -289,6 +294,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# -- 调度映射表：{工具名称: 处理函数} --
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(cast(BashToolInput, kw)["command"]),
     "read_file": lambda **kw: run_read(
@@ -319,10 +325,13 @@ def iter_text_blocks(content: object) -> Iterator[str]:
             yield block.text
 
 
+# -- 子代理：全新上下文、过滤后的工具、仅返回摘要 --
 def run_subagent(prompt: str) -> str:
-    sub_messages: list[MessageParam] = [{"role": "user", "content": prompt}]
+    sub_messages: list[MessageParam] = [
+        {"role": "user", "content": prompt}
+    ]  # 全新上下文
     response: Message | None = None
-    for _ in range(30):
+    for _ in range(30):  # 避免死循环，最多调用工具30次
         response = client.messages.create(
             model=MODEL,
             system=SUBAGENT_SYSTEM,
@@ -348,6 +357,7 @@ def run_subagent(prompt: str) -> str:
 
     if response is None:
         return "(no summary)"
+    # 返回所有文本块的内容拼接，子代理的最后输出应该是一个摘要文本块
     return "".join(iter_text_blocks(response.content)) or "(no summary)"
 
 
@@ -395,6 +405,7 @@ def agent_loop(messages: list[MessageParam]) -> None:
         for block in response.content:
             if block.type == "tool_use":
                 if block.name == "task":
+                    # 任务工具需要特殊处理，调用子代理
                     results.append(execute_task_block(block))
                 else:
                     results.append(execute_tool_block(block))
@@ -402,6 +413,7 @@ def agent_loop(messages: list[MessageParam]) -> None:
                     used_todo = True
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
+            # 增加催促更新进度的提醒
             results.append(
                 {"type": "text", "text": "<reminder>Update your todos.</reminder>"}
             )
