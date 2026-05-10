@@ -1,4 +1,15 @@
-"""极简 Python Agent Harness：支持基础工具调用、持久化任务、todo 跟踪、skill 按需加载、上下文压缩与 subagent 委派。"""
+"""
+极简 Python Agent Harness
+
+支持：
+- 基础 Bash 工具调用
+- todo 跟踪
+- subagent 委派
+- skill 按需加载
+- 上下文压缩
+- 持久化任务系统
+- 后台任务
+"""
 
 import json
 import os
