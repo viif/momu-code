@@ -46,7 +46,18 @@ SKILLS_DIR = WORKDIR / "skills"
 TASKS_DIR = WORKDIR / ".tasks"
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
-VALID_MSG_TYPES = {"message"}
+VALID_MSG_TYPES = {
+    "message",
+    "broadcast",
+    "shutdown_request",
+    "shutdown_response",
+    "plan_approval_response",
+}
+
+# -- 请求追踪器：通过 request_id 进行关联 --
+shutdown_requests: dict[str, dict[str, object]] = {}
+plan_requests: dict[str, dict[str, object]] = {}
+_tracker_lock = threading.Lock()
 
 
 class SkillMeta(TypedDict):
@@ -125,6 +136,7 @@ SYSTEM = build_system_prompt(
     "Background task completions are delivered in <background-results>. "
     "Use the subagent tool to delegate exploration or scoped subtasks. "
     "Use spawn_teammate to create named teammates and use send_message/read_inbox to coordinate through inboxes. "
+    "Manage shutdown and plan approval workflows for teammates when needed. "
     "Teammate messages arrive in <inbox>. "
     "Mark in_progress before starting and completed when done. "
 )
@@ -135,6 +147,7 @@ SUBAGENT_SYSTEM = build_system_prompt(
 TEAMMATE_SYSTEM = build_system_prompt(
     f"You are a coding teammate at {WORKDIR}. Complete the assigned task, "
     "use send_message to report back to lead or other teammates, and check read_inbox for follow-up messages. "
+    "Submit plans via plan_approval before major work and respond to shutdown_request with shutdown_response. "
 )
 COMPACT_THRESHOLD = 50000
 COMPACT_KEEP_RECENT_RESULTS = 3
@@ -216,6 +229,28 @@ class SpawnTeammateToolInput(TypedDict):
 class SendMessageToolInput(TypedDict):
     to: str
     content: str
+    msg_type: NotRequired[str]
+
+
+class BroadcastToolInput(TypedDict):
+    content: str
+
+
+class ShutdownRequestToolInput(TypedDict):
+    teammate: str
+
+
+class ShutdownResponseToolInput(TypedDict):
+    request_id: str
+    approve: NotRequired[bool]
+    reason: NotRequired[str]
+
+
+class PlanApprovalToolInput(TypedDict):
+    request_id: NotRequired[str]
+    approve: NotRequired[bool]
+    feedback: NotRequired[str]
+    plan: NotRequired[str]
 
 
 class ReadInboxToolInput(TypedDict):
@@ -450,6 +485,7 @@ SEND_MESSAGE_TOOL: ToolParam = {
         "properties": {
             "to": {"type": "string"},
             "content": {"type": "string"},
+            "msg_type": {"type": "string", "enum": sorted(VALID_MSG_TYPES)},
         },
         "required": ["to", "content"],
     },
@@ -461,12 +497,62 @@ READ_INBOX_TOOL: ToolParam = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
+BROADCAST_TOOL: ToolParam = {
+    "name": "broadcast",
+    "description": "Send a message to all teammates.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"content": {"type": "string"}},
+        "required": ["content"],
+    },
+}
+
+SHUTDOWN_REQUEST_TOOL: ToolParam = {
+    "name": "shutdown_request",
+    "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"teammate": {"type": "string"}},
+        "required": ["teammate"],
+    },
+}
+
+SHUTDOWN_RESPONSE_TOOL: ToolParam = {
+    "name": "shutdown_response",
+    "description": "Respond to or check the status of a shutdown request by request_id.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "request_id": {"type": "string"},
+            "approve": {"type": "boolean"},
+            "reason": {"type": "string"},
+        },
+        "required": ["request_id"],
+    },
+}
+
+PLAN_APPROVAL_TOOL: ToolParam = {
+    "name": "plan_approval",
+    "description": "Submit a plan for review, or approve/reject a teammate plan request.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "request_id": {"type": "string"},
+            "approve": {"type": "boolean"},
+            "feedback": {"type": "string"},
+            "plan": {"type": "string"},
+        },
+    },
+}
+
 # 父代理可用所有工具，子代理不可用 subagent 与持久化 task 工具以避免递归与状态混乱
 CHILD_TOOLS: list[ToolParam] = [*BASE_TOOLS]
 TEAMMATE_TOOLS: list[ToolParam] = [
     *BASE_TOOLS,
     SEND_MESSAGE_TOOL,
     READ_INBOX_TOOL,
+    SHUTDOWN_RESPONSE_TOOL,
+    PLAN_APPROVAL_TOOL,
 ]
 PARENT_TOOLS: list[ToolParam] = [
     *BASE_TOOLS,
@@ -482,6 +568,10 @@ PARENT_TOOLS: list[ToolParam] = [
     LIST_TEAMMATES_TOOL,
     SEND_MESSAGE_TOOL,
     READ_INBOX_TOOL,
+    BROADCAST_TOOL,
+    SHUTDOWN_REQUEST_TOOL,
+    SHUTDOWN_RESPONSE_TOOL,
+    PLAN_APPROVAL_TOOL,
 ]
 
 
@@ -748,16 +838,23 @@ class MessageBus:
         self.dir.mkdir(parents=True, exist_ok=True)
 
     def send(
-        self, sender: str, to: str, content: str, msg_type: str = "message"
+        self,
+        sender: str,
+        to: str,
+        content: str,
+        msg_type: str = "message",
+        extra: dict[str, object] | None = None,
     ) -> str:
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
-        msg = {
+        msg: dict[str, object] = {
             "type": msg_type,
             "from": sender,
             "content": content,
             "timestamp": time.time(),
         }
+        if extra:
+            msg.update(extra)
         inbox_path = self.dir / f"{to}.jsonl"
         with inbox_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
@@ -775,8 +872,16 @@ class MessageBus:
         inbox_path.write_text("", encoding="utf-8", errors="replace")
         return messages
 
+    def broadcast(self, sender: str, content: str, teammates: list[str]) -> str:
+        count = 0
+        for name in teammates:
+            if name != sender:
+                self.send(sender, name, content, "broadcast")
+                count += 1
+        return f"Broadcast to {count} teammates"
 
-# -- 队友管理器：基于 config.json 持久化存储的命名智能体 --
+
+# -- 队友管理器：基于 config.json 持久化存储的命名智能体，支持协议关闭与计划审批 --
 class TeammateManager:
     def __init__(self, team_dir: Path) -> None:
         self.dir = team_dir
@@ -814,8 +919,9 @@ class TeammateManager:
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find_member(name)
         if member:
-            if member.get("status") == "working":
-                return f"Error: '{name}' is currently working"
+            status = cast(str, member.get("status", "idle"))
+            if status not in ("idle", "shutdown"):
+                return f"Error: '{name}' is currently {status}"
             member["role"] = role
             member["status"] = "working"
         else:
@@ -864,14 +970,52 @@ class TeammateManager:
                 sender,
                 cast(str, args["to"]),
                 cast(str, args["content"]),
+                cast(str, args.get("msg_type", "message")),
             )
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2, ensure_ascii=False)
+        if tool_name == "shutdown_response":
+            request_id = cast(str, args["request_id"])
+            approve = bool(args.get("approve"))
+            reason = cast(str, args.get("reason", ""))
+            with _tracker_lock:
+                if request_id in shutdown_requests:
+                    shutdown_requests[request_id]["status"] = (
+                        "approved" if approve else "rejected"
+                    )
+            BUS.send(
+                sender,
+                "lead",
+                reason,
+                "shutdown_response",
+                {"request_id": request_id, "approve": approve},
+            )
+            return f"Shutdown {'approved' if approve else 'rejected'}"
+        if tool_name == "plan_approval":
+            plan_text = cast(str, args.get("plan", ""))
+            request_id = str(uuid.uuid4())[:8]
+            with _tracker_lock:
+                plan_requests[request_id] = {
+                    "from": sender,
+                    "plan": plan_text,
+                    "status": "pending",
+                }
+            BUS.send(
+                sender,
+                "lead",
+                plan_text,
+                "plan_approval_response",
+                {"request_id": request_id, "plan": plan_text},
+            )
+            return (
+                f"Plan submitted (request_id={request_id}). Waiting for lead approval."
+            )
         return f"Unknown tool: {tool_name}"
 
     def _teammate_loop(self, name: str, role: str, prompt: str) -> None:
         messages: list[MessageParam] = [{"role": "user", "content": prompt}]
         response: Message | None = None
+        should_exit = False
         try:
             for _ in range(30):
                 inbox = BUS.read_inbox(name)
@@ -882,6 +1026,8 @@ class TeammateManager:
                             "content": render_inbox_messages(inbox),
                         }
                     )
+                if should_exit:
+                    break
                 micro_compact(messages)
                 if estimate_tokens(messages) > COMPACT_THRESHOLD:
                     auto_compact(messages, focus=f"Continue teammate {name} work")
@@ -922,6 +1068,10 @@ class TeammateManager:
                             "content": output,
                         }
                     )
+                    if block.name == "shutdown_response" and cast(
+                        bool | None, block.input.get("approve")
+                    ):
+                        should_exit = True
                 messages.append({"role": "user", "content": results})
                 if manual_compact:
                     auto_compact(
@@ -929,7 +1079,7 @@ class TeammateManager:
                         compact_focus or f"Continue teammate {name} work",
                     )
         finally:
-            self._set_status(name, "idle")
+            self._set_status(name, "shutdown" if should_exit else "idle")
 
     def list_all(self) -> str:
         members = self._members()
@@ -955,6 +1105,48 @@ TASKS = TaskManager(TASKS_DIR)
 BG = BackgroundManager()
 BUS = MessageBus(INBOX_DIR)
 TEAM = TeammateManager(TEAM_DIR)
+
+
+def handle_shutdown_request(teammate: str) -> str:
+    req_id = str(uuid.uuid4())[:8]
+    with _tracker_lock:
+        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    BUS.send(
+        "lead",
+        teammate,
+        "Please shut down gracefully.",
+        "shutdown_request",
+        {"request_id": req_id},
+    )
+    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+
+
+def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    with _tracker_lock:
+        request = plan_requests.get(request_id)
+    if not request:
+        return f"Error: Unknown plan request_id '{request_id}'"
+    with _tracker_lock:
+        request["status"] = "approved" if approve else "rejected"
+    teammate = cast(str, request["from"])
+    BUS.send(
+        "lead",
+        teammate,
+        feedback,
+        "plan_approval_response",
+        {
+            "request_id": request_id,
+            "approve": approve,
+            "feedback": feedback,
+        },
+    )
+    return f"Plan {request['status']} for '{teammate}'"
+
+
+def check_shutdown_status(request_id: str) -> str:
+    with _tracker_lock:
+        request = shutdown_requests.get(request_id, {"error": "not found"})
+    return json.dumps(request, ensure_ascii=False)
 
 
 # -- 父代理与子代理共享的工具实现 --
@@ -1071,9 +1263,26 @@ TOOL_HANDLERS = {
         "lead",
         cast(SendMessageToolInput, kw)["to"],
         cast(SendMessageToolInput, kw)["content"],
+        cast(SendMessageToolInput, kw).get("msg_type", "message"),
     ),
     "read_inbox": lambda **kw: json.dumps(
         BUS.read_inbox("lead"), indent=2, ensure_ascii=False
+    ),
+    "broadcast": lambda **kw: BUS.broadcast(
+        "lead",
+        cast(BroadcastToolInput, kw)["content"],
+        TEAM.member_names(),
+    ),
+    "shutdown_request": lambda **kw: handle_shutdown_request(
+        cast(ShutdownRequestToolInput, kw)["teammate"]
+    ),
+    "shutdown_response": lambda **kw: check_shutdown_status(
+        cast(ShutdownResponseToolInput, kw)["request_id"]
+    ),
+    "plan_approval": lambda **kw: handle_plan_review(
+        cast(str, cast(PlanApprovalToolInput, kw).get("request_id", "")),
+        bool(cast(PlanApprovalToolInput, kw).get("approve", False)),
+        cast(PlanApprovalToolInput, kw).get("feedback", ""),
     ),
 }
 
