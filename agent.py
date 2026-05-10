@@ -108,6 +108,10 @@ SUBAGENT_SYSTEM = build_system_prompt(
     f"You are a coding subagent at {WORKDIR}. Complete the given task "
     "with fresh context, then return a concise summary. "
 )
+COMPACT_THRESHOLD = 50000
+COMPACT_KEEP_RECENT_RESULTS = 3
+COMPACT_PRESERVE_RESULT_TOOLS = {"read_file", "load_skill", "todo", "task"}
+ENABLE_SUBAGENT_AUTO_COMPACT = False
 
 
 class BashToolInput(TypedDict):
@@ -139,6 +143,10 @@ class LoadSkillToolInput(TypedDict):
     name: str
 
 
+class CompactToolInput(TypedDict):
+    focus: NotRequired[str]
+
+
 TodoStatus = Literal["pending", "in_progress", "completed"]
 
 
@@ -153,6 +161,19 @@ class TodoToolInput(TypedDict):
 
 
 BASE_TOOLS: list[ToolParam] = [
+    {
+        "name": "compact",
+        "description": "Compress the conversation context and keep only a continuity summary.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "What to preserve in the summary",
+                }
+            },
+        },
+    },
     {
         "name": "bash",
         "description": "Run a shell command.",
@@ -402,21 +423,149 @@ TOOL_HANDLERS = {
     "load_skill": lambda **kw: SKILL_LOADER.get_content(
         cast(LoadSkillToolInput, kw)["name"]
     ),
+    "compact": lambda **kw: "Manual compression requested.",
     "todo": lambda **kw: TODO.update(cast(TodoToolInput, kw)["items"]),
 }
 
 
+def get_block_type(block: object) -> str | None:
+    if isinstance(block, dict):
+        return cast(str | None, cast(dict[str, object], block).get("type"))
+    return cast(str | None, getattr(block, "type", None))
+
+
+def get_block_text(block: object) -> str | None:
+    if isinstance(block, dict):
+        return cast(str | None, cast(dict[str, object], block).get("text"))
+    return cast(str | None, getattr(block, "text", None))
+
+
+def get_block_name(block: object) -> str | None:
+    if isinstance(block, dict):
+        return cast(str | None, cast(dict[str, object], block).get("name"))
+    return cast(str | None, getattr(block, "name", None))
+
+
+def get_block_id(block: object) -> str | None:
+    if isinstance(block, dict):
+        return cast(str | None, cast(dict[str, object], block).get("id"))
+    return cast(str | None, getattr(block, "id", None))
+
+
+def get_block_input(block: object) -> dict[str, object]:
+    if isinstance(block, dict):
+        return cast(dict[str, object], cast(dict[str, object], block).get("input", {}))
+    return cast(dict[str, object], getattr(block, "input", {}))
+
+
+def estimate_tokens(messages: list[MessageParam]) -> int:
+    return len(str(messages)) // 4
+
+
+# 通过匹配之前的 assistant 消息中的 tool_use_id，查找每个结果对应的 tool_name
+def build_tool_name_map(messages: list[MessageParam]) -> dict[str, str]:
+    tool_name_map: dict[str, str] = {}
+    for msg in messages:
+        if msg["role"] != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if get_block_type(block) != "tool_use":
+                continue
+            block_id = get_block_id(block)
+            block_name = get_block_name(block)
+            if block_id and block_name:
+                tool_name_map[block_id] = block_name
+    return tool_name_map
+
+
+# -- 压缩第 1 层：micro_compact - 用占位符替换旧的工具结果 --
+def micro_compact(messages: list[MessageParam]) -> None:
+    # 收集所有 tool_result 条目的 (msg_index, part_index, tool_result_dict)
+    tool_results: list[dict[str, object]] = []
+    for msg in messages:
+        if msg["role"] != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                tool_results.append(cast(dict[str, object], block))
+
+    if len(tool_results) <= COMPACT_KEEP_RECENT_RESULTS:
+        return
+
+    tool_name_map = build_tool_name_map(messages)
+    # 清理旧的结果（保留最近的 KEEP_RECENT 个）
+    for result in tool_results[:-COMPACT_KEEP_RECENT_RESULTS]:
+        content = result.get("content")
+        if not isinstance(content, str) or len(content) <= 100:
+            continue
+        tool_use_id = cast(str, result.get("tool_use_id", ""))
+        tool_name = tool_name_map.get(tool_use_id, "unknown")
+        if tool_name in COMPACT_PRESERVE_RESULT_TOOLS:
+            continue
+        result["content"] = f"[Compacted previous result from {tool_name}]"
+
+
+def summarize_messages(
+    messages: list[MessageParam], focus: str | None = None, *, is_subagent: bool = False
+) -> str:
+    conversation_text = str(messages)[-80000:]
+    focus_line = f"Focus: {focus}\n\n" if focus else ""
+    scope = "subagent" if is_subagent else "agent"
+    response = client.messages.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Summarize this coding-agent conversation for continuity. "
+                    "Include: 1) what was accomplished, 2) current state, "
+                    "3) active todos or pending work, 4) key decisions, "
+                    "5) important file paths and findings. "
+                    f"This summary is for a {scope} conversation.\n\n"
+                    + focus_line
+                    + conversation_text
+                ),
+            }
+        ],
+        max_tokens=2000,
+    )
+    return "".join(iter_text_blocks(response.content)) or "No summary generated."
+
+
+# -- 压缩第 2 层：auto_compact - 保存对话记录，生成摘要，替换消息 --
+def auto_compact(
+    messages: list[MessageParam], focus: str | None = None, *, is_subagent: bool = False
+) -> None:
+    summary = summarize_messages(messages, focus, is_subagent=is_subagent)
+    label = "Subagent" if is_subagent else "Conversation"
+    messages[:] = [
+        {
+            "role": "user",
+            "content": (
+                f"[{label} compressed. Continue from this summary.]\n\n{summary}"
+            ),
+        }
+    ]
+
+
 def iter_text_blocks(content: object) -> Iterator[str]:
+    if isinstance(content, str):
+        yield content
+        return
     if not isinstance(content, list):
         return
 
     for block in content:
-        if isinstance(block, dict):
-            typed_block = cast(dict[str, object], block)
-            if typed_block.get("type") == "text":
-                yield cast(str, typed_block["text"])
-        elif block.type == "text":
-            yield block.text
+        if get_block_type(block) == "text":
+            text = get_block_text(block)
+            if text:
+                yield text
 
 
 # -- 子代理：全新上下文、过滤后的工具、仅返回摘要 --
@@ -425,7 +574,15 @@ def run_subagent(prompt: str) -> str:
         {"role": "user", "content": prompt}
     ]  # 全新上下文
     response: Message | None = None
-    for _ in range(30):  # 避免死循环，最多调用工具30次
+    for _ in range(30):  # 避免死循环，子代理最多调用工具30次
+        # 压缩第 1 层：在每次调用 LLM 之前执行 micro_compact
+        micro_compact(sub_messages)
+        # 压缩第 2 层：如果预估 Token 数超过阈值，则执行 auto_compact
+        if (
+            ENABLE_SUBAGENT_AUTO_COMPACT
+            and estimate_tokens(sub_messages) > COMPACT_THRESHOLD
+        ):
+            auto_compact(sub_messages, is_subagent=True)
         response = client.messages.create(
             model=MODEL,
             system=SUBAGENT_SYSTEM,
@@ -438,8 +595,13 @@ def run_subagent(prompt: str) -> str:
             break
 
         results: list[ToolResultBlockParam] = []
+        manual_compact = False
+        compact_focus: str | None = None
         for block in response.content:
             if block.type == "tool_use":
+                if block.name == "compact":
+                    manual_compact = True
+                    compact_focus = cast(CompactToolInput, block.input).get("focus")
                 handler = TOOL_HANDLERS.get(block.name)
                 output = (
                     handler(**block.input) if handler else f"Unknown tool: {block.name}"
@@ -448,6 +610,9 @@ def run_subagent(prompt: str) -> str:
                     {"type": "tool_result", "tool_use_id": block.id, "content": output}
                 )
         sub_messages.append({"role": "user", "content": results})
+        # 压缩第 3 层：由 compact 工具触发的手动压缩
+        if manual_compact:
+            auto_compact(sub_messages, compact_focus, is_subagent=True)
 
     if response is None:
         return "(no summary)"
@@ -487,6 +652,11 @@ def create_response(messages: list[MessageParam]) -> Message:
 def agent_loop(messages: list[MessageParam]) -> None:
     rounds_since_todo = 0
     while True:
+        # 压缩第 1 层：在每次调用 LLM 之前执行 micro_compact
+        micro_compact(messages)
+        # 压缩第 2 层：如果预估 Token 数超过阈值，则执行 auto_compact
+        if estimate_tokens(messages) > COMPACT_THRESHOLD:
+            auto_compact(messages)
         response = create_response(messages)
         # 追加助手的回复内容
         messages.append({"role": "assistant", "content": response.content})
@@ -496,8 +666,13 @@ def agent_loop(messages: list[MessageParam]) -> None:
         # 执行每个工具调用，并收集结果
         results: list[ToolResultBlockParam | TextBlockParam] = []
         used_todo = False
+        manual_compact = False
+        compact_focus: str | None = None
         for block in response.content:
             if block.type == "tool_use":
+                if block.name == "compact":
+                    manual_compact = True
+                    compact_focus = cast(CompactToolInput, block.input).get("focus")
                 if block.name == "task":
                     # 任务工具需要特殊处理，调用子代理
                     results.append(execute_task_block(block))
@@ -512,6 +687,9 @@ def agent_loop(messages: list[MessageParam]) -> None:
                 {"type": "text", "text": "<reminder>Update your todos.</reminder>"}
             )
         messages.append({"role": "user", "content": results})
+        # 压缩第 3 层：由 compact 工具触发的手动压缩
+        if manual_compact:
+            auto_compact(messages, compact_focus)
 
 
 if __name__ == "__main__":
