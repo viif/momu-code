@@ -1,6 +1,4 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# AGENTS.md
 
 ## 项目定位
 
@@ -11,12 +9,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 基础文件与 shell 工具调用
 - session 级 todo 跟踪
 - 持久化任务系统
-- subagent 委派
+- Explore / general-purpose 两类 subagent 委派
 - skill 按需加载
+- 上下文压缩与 `/compact` 手动压缩
 - 后台任务
-- teammate 协作与收件箱消息机制
+- teammate 协作、空闲轮询、自动认领任务与收件箱消息机制
 - plan approval / shutdown 协议
-- 基于 git worktree 的隔离执行
+- 基于 git worktree 的隔离执行、任务绑定与生命周期事件
 
 ## 常用开发命令
 
@@ -24,6 +23,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - 优先使用的依赖安装方式。
 - `uv run python agent.py`
   - 启动交互式命令行 REPL。
+
+REPL 内置命令：
+- `/compact`：压缩当前对话历史。
+- `/team`：查看 teammate 列表与状态。
+- `/inbox`：读取并清空 lead 收件箱。
+- `/tasks`：查看持久化任务列表。
 
 当前仓库还没有提交测试框架、lint 配置或格式化配置，因此也没有项目内标准的单测运行命令。
 
@@ -43,19 +48,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 仓库协作约定
 
 - 这是一个有意保持极简的 Harness，除非需求明显扩大，否则不要主动拆分为多模块结构。
-- `CLAUDE.md` 只保留仓库级协作信息，不记录过多实现细节。
+- `AGENTS.md` 只保留仓库级协作信息，不记录过多实现细节。
 - 本项目统一使用 `uv` 管理依赖与运行。
 - 修改 `agent.py` 时优先复用现有管理器与工具分层，不要为一次性逻辑额外抽象新模块。
 - 如果后续引入测试、lint、格式化或新的开发命令，需同步更新本文件。
 
 ## 关键文件
 
-- `agent.py`：当前主要实现入口，包含工具定义、消息循环、任务/队友/worktree 管理等核心逻辑。
+- `agent.py`：当前主要实现入口，包含工具定义、消息循环、上下文压缩、任务/队友/worktree 管理等核心逻辑。
 - `pyproject.toml`：项目元数据与依赖定义。
 - `uv.lock`：`uv` 锁文件。
 - `README.md`：面向人类读者的项目说明。
 - `.env.example`：本地环境变量示例。
 - `skills/*/SKILL.md`：可被 harness 按需加载的技能定义。
+- `.tasks/`：持久化任务 JSON 文件，运行时自动维护。
+- `.team/`：teammate 配置与 inbox 数据，运行时自动维护。
+- `.worktrees/`：worktree 索引、实际 worktree 目录与事件日志，运行时自动维护。
 
 ## 依赖概览
 
